@@ -3,7 +3,10 @@
 # dependencies = [
 #     "google-genai",
 #     "sqlite-vec",
-#     "ddgs"
+#     "ddgs",
+#     "feedparser>=6.0.12",
+#     "requests>=2.32.5",
+#     "pydantic>=2.12.5"
 # ]
 # ///
 #!/usr/bin/env python3
@@ -12,6 +15,7 @@
 
 import os
 import sys
+import readline  # noqa: F401
 import shutil
 import logging
 import json
@@ -34,6 +38,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from pydantic import BaseModel, Field
 
 from google import genai
 from google.genai import types
@@ -186,7 +191,7 @@ class SessionTracker:
     """
 
     def __init__(self):
-        self.logs_dir: Path = vromlix.paths.base / "01_active_memory" / "sessions"
+        self.logs_dir: Path = vromlix.paths.active_memory / "sessions"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
         self.session_id: str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -272,44 +277,186 @@ class SessionTracker:
         return tracker.strip()
 
 
+# --- ESQUEMAS PYDANTIC (DAG) ---
+class ExecutionStep(BaseModel):
+    step_id: str = Field(description="Unique ID for this step, e.g., 'step_1'")
+    expert_id: str = Field(description="ID of the selected expert")
+    required_files: list[str] = Field(
+        default_factory=list, description="Exact filenames required by this expert"
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="List of step_ids that must finish before this step starts",
+    )
+
+
+class SimulatedPath(BaseModel):
+    path_logic: str = Field(description="Description of this potential routing path")
+    success_probability: float = Field(
+        description="Estimated probability of success (0.0 to 1.0)"
+    )
+
+
+class RoutingResult(BaseModel):
+    mcts_simulations: list[SimulatedPath] = Field(
+        description="Simulate at least 2 different routing paths before deciding"
+    )
+    internal_analysis: str = Field(
+        description="Logic on why the winning DAG structure was chosen over the alternatives"
+    )
+    execution_plan: list[ExecutionStep] = Field(
+        description="List of execution steps forming the winning Directed Acyclic Graph"
+    )
+    search_queries: list[str] = Field(
+        default_factory=list,
+        description="Array of search queries, empty if none needed",
+    )
+
+
 # --- 2. COGNITIVE PIPELINE & MoE ROUTING (V2.0) ---
-
-
 class MoERouter:
     """
     Enrutador Semántico Avanzado (Mixture of Experts).
     Analiza el input y selecciona MÚLTIPLES expertos, determinando si se requiere
     búsqueda web (Grounding) o acceso al repositorio de código.
+    Implementa Pasarela de Enrutamiento Semántico (Zero-LLM) para consultas directas.
     """
 
     def __init__(
         self, moe_json_content: str, monitor: TokenMonitor, router_prompt: str
     ):
         self.model_id = vromlix.get_model("VOLUMEN")  # Modelo rápido para triaje
+        self.embed_model = (
+            vromlix.get_secret("EMBEDDINGS")["model_id"]
+            if vromlix.get_secret("EMBEDDINGS")
+            else "gemini-embedding-2-preview"
+        )
         self.monitor = monitor
         self.router_prompt = router_prompt
+        self.cache_path = vromlix.paths.active_memory / "expert_embeddings_cache.json"
         try:
             self.moe_data = json.loads(moe_json_content)
         except json.JSONDecodeError:
             logging.error("CRITICAL: Fallo al parsear 02_MoE_Routing.json")
             self.moe_data = []
 
+        # Cargar o generar embeddings de los expertos en background (Lazy)
+        self.expert_vectors = self._load_expert_vectors()
+
+    def _cosine_similarity(self, v1: list[float], v2: list[float]) -> float:
+        import math
+
+        dot_product = sum(a * b for a, b in zip(v1, v2))
+        mag1 = math.sqrt(sum(a * a for a in v1))
+        mag2 = math.sqrt(sum(b * b for b in v2))
+        if mag1 == 0 or mag2 == 0:
+            return 0.0
+        return dot_product / (mag1 * mag2)
+
+    def _load_expert_vectors(self) -> dict[str, list[float]]:
+        """Carga los vectores cacheados o los genera si el MoE cambió."""
+        if self.cache_path.exists():
+            try:
+                with open(self.cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                    # Validar si la cantidad de expertos coincide
+                    if len(cache) == len(self.moe_data):
+                        return cache
+            except Exception:
+                pass
+
+        # Si no hay caché válido, generamos los embeddings
+        logging.info(
+            "🧠 [Semantic Router] Generando embeddings de expertos (Cache Miss)..."
+        )
+        vectors = {}
+        try:
+            client = genai.Client(api_key=vromlix.get_api_key())
+            for exp in self.moe_data:
+                # Crear un documento semántico denso para el experto
+                doc = f"Role: {exp['expert_id']}. Mechanics: {', '.join(exp.get('mechanics', []))}. Instructions: {', '.join(exp.get('instructions', []))}."
+                response = client.models.embed_content(
+                    model=self.embed_model,
+                    contents=doc,
+                    config=types.EmbedContentConfig(
+                        task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768
+                    ),
+                )
+                vectors[exp["expert_id"]] = response.embeddings[0].values
+
+            # Guardar caché
+            with open(self.cache_path, "w", encoding="utf-8") as f:
+                json.dump(vectors, f)
+        except Exception as e:
+            logging.warning(f"⚠️ Fallo al generar vectores de expertos: {e}")
+        return vectors
+
     def determine_routing(self, user_query: str, recent_context: str) -> dict:
         """
         Devuelve un diccionario con los expertos seleccionados y las banderas de contexto.
+        Utiliza Pasarela Semántica (Zero-LLM) primero, y Pydantic como Fallback.
         """
         if not self.moe_data:
             return {
-                "experts": [
+                "execution_plan": [
                     {
+                        "step_id": "step_1",
                         "expert_id": "ORCHESTRATE_SYSTEM_CORE",
                         "instructions": ["Fallback mode."],
+                        "dynamic_files": [],
+                        "depends_on": [],
                     }
                 ],
-                "requires_web_search": False,
-                "requires_code_repo": False,
+                "search_queries": [],
             }
 
+        # --- 1. PASARELA SEMÁNTICA (ZERO-LLM ROUTING) ---
+        # Si no hay contexto reciente complejo, intentamos enrutamiento matemático directo
+        if self.expert_vectors and len(recent_context) < 500:
+            try:
+                client = genai.Client(api_key=vromlix.get_api_key())
+                response = client.models.embed_content(
+                    model=self.embed_model,
+                    contents=user_query,
+                    config=types.EmbedContentConfig(
+                        task_type="RETRIEVAL_QUERY", output_dimensionality=768
+                    ),
+                )
+                query_vector = response.embeddings[0].values
+
+                best_expert = None
+                max_sim = -1.0
+
+                for exp_id, exp_vector in self.expert_vectors.items():
+                    sim = self._cosine_similarity(query_vector, exp_vector)
+                    if sim > max_sim:
+                        max_sim = sim
+                        best_expert = exp_id
+
+                # Umbral de confianza estricto (0.75 suele ser alto en embeddings de Gemini)
+                if max_sim > 0.75 and best_expert:
+                    logging.info(
+                        f"⚡ [Semantic Router] Cortocircuito activado: {best_expert} (Similitud: {max_sim:.2f})"
+                    )
+                    matched_profile: dict[str, Any] = next(
+                        (
+                            exp
+                            for exp in self.moe_data
+                            if exp["expert_id"] == best_expert
+                        ),
+                        {},
+                    )
+                    step_dict = dict(matched_profile)
+                    step_dict["step_id"] = "step_1"
+                    step_dict["dynamic_files"] = []
+                    step_dict["depends_on"] = []
+                    return {"execution_plan": [step_dict], "search_queries": []}
+            except Exception as e:
+                logging.warning(
+                    f"⚠️ Fallo en Pasarela Semántica, usando LLM Fallback: {e}"
+                )
+
+        # --- 2. ENRUTAMIENTO LLM (PYDANTIC FALLBACK) ---
         routing_map = [
             {"id": exp["expert_id"], "cluster": exp["parent_cluster"]}
             for exp in self.moe_data
@@ -332,31 +479,29 @@ class MoERouter:
                 model=self.model_id,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.0, response_mime_type="application/json"
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema=RoutingResult,  # <--- LA MAGIA DE PYDANTIC AQUI
                 ),
             )
             self.monitor.add_usage("MoERouter", response.usage_metadata)
 
-            result = json.loads(response.text)
-            raw_experts = result.get(
-                "selected_experts",
-                [{"id": "ORCHESTRATE_SYSTEM_CORE", "required_files": []}],
-            )
-            raw_experts = raw_experts[:3]  # Límite estricto de 3 expertos
+            # La API garantiza que el JSON cumple con Pydantic
+            result = RoutingResult.model_validate_json(response.text)
 
-            selected_profiles = []
-            for exp_req in raw_experts:
-                # Fallback de seguridad por si el LLM alucina el formato antiguo (lista de strings)
-                if isinstance(exp_req, str):
-                    exp_id = exp_req
-                    req_files = []
-                else:
-                    exp_id = exp_req.get("id", "ORCHESTRATE_SYSTEM_CORE")
-                    req_files = exp_req.get("required_files", [])
+            # Imprimir el razonamiento interno del Router (CoT) en la consola
+            logging.info(f"🧠 [Router CoT]: {result.internal_analysis}")
 
-                # Buscar el perfil original
+            # Extraer y mapear el Plan de Ejecución (DAG)
+            execution_plan = []
+            for step in result.execution_plan[:3]:  # Límite de 3 pasos
                 profile: dict[str, Any] = next(
-                    (exp for exp in self.moe_data if exp["expert_id"] == exp_id), {}
+                    (
+                        exp
+                        for exp in self.moe_data
+                        if exp["expert_id"] == step.expert_id
+                    ),
+                    {},
                 )
                 if not profile:
                     profile = next(
@@ -368,40 +513,85 @@ class MoERouter:
                         {},
                     )
 
-                # Clonar el perfil e inyectarle los archivos dinámicos solicitados
-                profile_copy = dict(profile or {})
-                profile_copy["dynamic_files"] = req_files
-                selected_profiles.append(profile_copy)
+                step_dict = dict(profile or {})
+                step_dict["step_id"] = step.step_id
+                step_dict["dynamic_files"] = step.required_files
+                step_dict["depends_on"] = step.depends_on
+                execution_plan.append(step_dict)
 
             logging.info(
-                f"🔀 MoE Router: Enjambre activado -> {[p['expert_id'] for p in selected_profiles]}"
+                f"🔀 MoE Router: DAG Planificado -> {[s['step_id'] + '(' + s['expert_id'] + ')' for s in execution_plan]}"
             )
-            search_queries = result.get("search_queries", [])
-            if search_queries:
+
+            if result.search_queries:
                 logging.info(
-                    f"🌐 MoE Router: Búsqueda Web solicitada -> {search_queries}"
+                    f"🌐 MoE Router: Búsqueda Web solicitada -> {result.search_queries}"
                 )
 
             return {
-                "experts": selected_profiles,
-                "search_queries": search_queries,
+                "execution_plan": execution_plan,
+                "search_queries": result.search_queries,
             }
 
         except Exception as e:
             logging.warning(f"Fallo en MoE Routing ({e}). Usando Fallback.")
+            fallback_profile: dict[str, Any] = next(
+                (
+                    exp
+                    for exp in self.moe_data
+                    if exp["expert_id"] == "ORCHESTRATE_SYSTEM_CORE"
+                ),
+                {},
+            )
+            fallback_profile["step_id"] = "step_1"
+            fallback_profile["dynamic_files"] = []
+            fallback_profile["depends_on"] = []
             return {
-                "experts": [
-                    next(
-                        (
-                            exp
-                            for exp in self.moe_data
-                            if exp["expert_id"] == "ORCHESTRATE_SYSTEM_CORE"
-                        ),
-                        {},
-                    )
-                ],
+                "execution_plan": [fallback_profile],
                 "search_queries": [],
             }
+
+
+# --- HERRAMIENTAS LOCALES (MCP / FUNCTION CALLING) ---
+def leer_lineas_de_archivo(
+    filepath: str, linea_inicio: int = 1, linea_fin: int = 100
+) -> str:
+    """
+    Lee un rango específico de líneas de un archivo local para no saturar la memoria.
+    Útil para inspeccionar repositorios de código o documentos grandes por partes.
+
+    Args:
+        filepath: Ruta del archivo (ej. 'vromlix_utils.py' o 'docs/readme.md').
+        linea_inicio: Número de línea donde empezar a leer (1-indexado). Default 1.
+        linea_fin: Número de línea donde terminar. Default 100.
+    """
+    try:
+        from pathlib import Path
+
+        # Resolver ruta relativa a la base de Vromlix por seguridad
+        target_path = Path(vromlix.paths.base) / filepath
+
+        if not target_path.exists() or not target_path.is_file():
+            # Buscar en codex_memory como fallback
+            target_path = Path(vromlix.paths.codex_memory) / filepath
+            if not target_path.exists():
+                return f"[ERROR TOOL]: El archivo {filepath} no existe."
+
+        with open(target_path, "r", encoding="utf-8") as f:
+            lineas = f.readlines()
+
+        total_lineas = len(lineas)
+        inicio_idx = max(0, linea_inicio - 1)
+        fin_idx = min(total_lineas, linea_fin)
+
+        if inicio_idx >= total_lineas:
+            return f"[ERROR TOOL]: linea_inicio ({linea_inicio}) es mayor que el total de líneas ({total_lineas})."
+
+        fragmento = "".join(lineas[inicio_idx:fin_idx])
+        return f"--- ARCHIVO: {filepath} (Líneas {linea_inicio} a {fin_idx} de {total_lineas}) ---\n{fragmento}"
+
+    except Exception as e:
+        return f"[ERROR TOOL]: Fallo al leer {filepath} -> {str(e)}"
 
 
 class AgenticExecutor:
@@ -478,32 +668,39 @@ class AgenticExecutor:
             f"🔍 [Rayos X - {expert_id}] Chars -> Master: {len_master} | Web: {len_web} | RAG: {len_rag}"
         )
 
-        # --- INYECCIÓN DINÁMICA DE ARCHIVOS (SOTA) ---
+        # --- REFERENCIA DINÁMICA DE ARCHIVOS (MCP SOTA) ---
         if dynamic_files:
-            full_user_prompt += "=== DYNAMIC FILE CONTEXT ===\n"
+            full_user_prompt += "=== ARCHIVOS RELEVANTES IDENTIFICADOS ===\n"
+            full_user_prompt += "El sistema ha detectado que los siguientes archivos están relacionados con tu tarea.\n"
+            full_user_prompt += "NO intentes adivinar su contenido. DEBES usar explícitamente tu herramienta 'leer_lineas_de_archivo' para inspeccionarlos si lo requieres.\n"
             for fname in dynamic_files:
-                # Buscar en la raíz y en codex_memory
-                fpath = vromlix.paths.base / fname
-                if not fpath.exists():
-                    fpath = vromlix.paths.codex_memory / fname
-
-                if fpath.exists() and fpath.is_file():
-                    try:
-                        with open(fpath, "r", encoding="utf-8") as f:
-                            full_user_prompt += f"--- File: {fname} ---\n{f.read()}\n\n"
-                    except Exception as e:
-                        logging.warning(
-                            f"Error inyectando {fname} para {expert_id}: {e}"
-                        )
-                else:
-                    full_user_prompt += f"--- File: {fname} [NOT FOUND] ---\n\n"
+                full_user_prompt += f"- {fname}\n"
+            full_user_prompt += "=========================================\n\n"
 
         full_user_prompt += f"USER QUERY:\n{user_query}"
 
-        # 3. Configurar Herramientas (Ya no usamos google_search nativo)
-        tools = None
+        # 3. Configurar Herramientas (Function Calling / MCP Local)
+        tools = [leer_lineas_de_archivo]
 
-        # 4. Ejecución con Rotación Total y Thinking
+        # --- 3.5 EJECUCIÓN LOCAL OFFLINE (VÍA API OLLAMA EN UTILS) ---
+        if "LOCAL_" in expert_id:
+            logging.info(
+                f"🔋 [Local Engine] Solicitando inferencia a Ollama para {expert_id}..."
+            )
+
+            # 1. Obtenemos el nombre dinámico desde config_api_keys_secrets.py
+            modelo_local = vromlix.get_model("LOCAL")
+
+            # 2. Llamada limpia al orquestador central (vromlix_utils)
+            respuesta_local = vromlix.query_local_ollm(
+                model_name=modelo_local,
+                system_prompt=final_system_instruction,
+                user_prompt=full_user_prompt,
+            )
+
+            return {"expert_id": expert_id, "response": respuesta_local}
+
+        # 4. Ejecución con Rotación Total y Thinking (Nube)
         max_attempts = (
             len(vromlix.key_manager.keys) if hasattr(vromlix, "key_manager") else 110
         )
@@ -512,7 +709,10 @@ class AgenticExecutor:
             if not api_key:
                 return {"expert_id": expert_id, "response": "ERROR: No API Keys."}
 
-            client = genai.Client(api_key=api_key)
+            # Aplicamos el mismo escudo anti-congelamiento a los Expertos del Enjambre
+            client = genai.Client(
+                api_key=api_key, http_options=types.HttpOptions(api_version="v1alpha")
+            )
             try:
                 response = client.models.generate_content(
                     model=self.model_id,
@@ -540,6 +740,33 @@ class AgenticExecutor:
                             respuesta_final += part.text
                 else:
                     respuesta_final = response.text
+
+                # --- FASE 3: BUCLE DE REFLEXIÓN (AUTO-CORRECCIÓN CÍCLICA) ---
+                expected_sig = expert_profile.get("output_signature", "")
+                if expected_sig:
+                    # Extraer el marcador principal de la firma esperada
+                    sig_marker = ""
+                    if "```python" in expected_sig:
+                        sig_marker = "```python"
+                    elif "```bash" in expected_sig:
+                        sig_marker = "```bash"
+                    elif "###" in expected_sig:
+                        sig_marker = expected_sig.split("\n")[0].strip()
+
+                    # Si el marcador no está en la respuesta, forzamos un reintento (Ciclo)
+                    if sig_marker and sig_marker not in respuesta_final:
+                        if attempt < max_attempts - 1:
+                            logging.warning(
+                                f"🔄 [Reflexión] {expert_id} omitió la firma '{sig_marker}'. Forzando auto-corrección interna..."
+                            )
+                            # Inyectamos el regaño al final del prompt y el bucle 'for' vuelve a girar
+                            full_user_prompt += f"\n\n[SYSTEM FEEDBACK - ATTEMPT {attempt + 1} FAILED]: You hallucinated or ignored the constraints. You MUST include the exact signature '{sig_marker}' in your response. Correct your output and try again."
+                            continue
+                        else:
+                            logging.error(
+                                f"❌ [Reflexión] {expert_id} falló la auto-corrección tras múltiples intentos."
+                            )
+                # ------------------------------------------------------------
 
                 output_completo = (
                     f"{pensamientos}\n{respuesta_final}"
@@ -572,50 +799,83 @@ class AgenticExecutor:
         web_context: str = "",
     ) -> dict[str, str]:
         """
-        Orquesta la ejecución paralela del enjambre de expertos.
-        Retorna un diccionario con las respuestas de cada experto.
+        Orquesta la ejecución basada en un Grafo Acíclico Dirigido (DAG).
+        Si no hay dependencias, ejecuta en paralelo (Colmena).
+        Si hay dependencias, encola y hereda el contexto.
         """
         self.tracker.log_interaction("User", user_query)
 
-        experts = routing_data.get("experts", [])
+        execution_plan = routing_data.get("execution_plan", [])
+        if not execution_plan:
+            return {}
 
-        swarm_responses = {}
+        logging.info(
+            f"🧠 Ejecutando Motor DAG ({len(execution_plan)} pasos en la cola)..."
+        )
 
-        logging.info(f"🧠 Ejecutando Enjambre ({len(experts)} agentes) en paralelo...")
+        pending_steps = {step["step_id"]: step for step in execution_plan}
+        completed_responses: dict[str, str] = {}  # step_id -> response
+        in_progress: dict[concurrent.futures.Future, str] = {}  # Future -> step_id
 
-        # Ejecución Paralela usando ThreadPoolExecutor con Escalonamiento (Staggering)
+        # Motor de resolución de dependencias
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(experts)
+            max_workers=len(execution_plan)
         ) as executor:
-            futures = []
-            for i, exp in enumerate(experts):
-                if i > 0:
-                    time.sleep(
-                        6.0
-                    )  # Pausa extendida a 6 segundos para evitar el firewall de IP de Google
+            while pending_steps or in_progress:
+                # 1. Identificar pasos listos para ejecutarse (cuyas dependencias ya terminaron)
+                ready_steps = []
+                for step_id, step in list(pending_steps.items()):
+                    if all(
+                        dep in completed_responses for dep in step.get("depends_on", [])
+                    ):
+                        ready_steps.append(step_id)
 
-                futures.append(
-                    executor.submit(
+                # 2. Despachar pasos listos a los hilos
+                for step_id in ready_steps:
+                    step = pending_steps.pop(step_id)
+
+                    # Preparar la inyección del contexto heredado si hubo dependencias
+                    inherited_context = ""
+                    for dep in step.get("depends_on", []):
+                        inherited_context += f"--- OUTPUT HEREDADO DEL PASO: {dep} ---\n{completed_responses[dep]}\n\n"
+
+                    augmented_query = user_query
+                    if inherited_context:
+                        augmented_query = f"=== CONTEXTO DE EXPERTOS PREVIOS (DEPENDENCIAS) ===\n{inherited_context}\nUSER QUERY ORIGINAL:\n{user_query}"
+
+                    # Enviar a ejecución
+                    future = executor.submit(
                         self._execute_single_expert,
-                        exp,
-                        user_query,
+                        step,
+                        augmented_query,
                         recent_context,
                         web_context,
                         retrieved_rag,
                     )
-                )
+                    in_progress[future] = step_id
 
-            # Timeout de 120 segundos para evitar bloqueos infinitos si la API falla
-            for future in concurrent.futures.as_completed(futures, timeout=300.0):
-                try:
-                    result = future.result()
-                    swarm_responses[result["expert_id"]] = result["response"]
-                except concurrent.futures.TimeoutError:
-                    logging.error("Timeout: Un experto tardó demasiado en responder.")
-                except Exception as e:
-                    logging.error(f"Error en hilo de experto: {e}")
+                # 3. Esperar a que al menos UN hilo termine antes de continuar el bucle
+                if in_progress:
+                    done, _ = concurrent.futures.wait(
+                        in_progress.keys(),
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
 
-        return swarm_responses
+                    for future in done:
+                        step_id = in_progress.pop(future)
+                        try:
+                            result = future.result()
+                            # Guardar la respuesta etiquetada para que Ockham sepa quién dijo qué
+                            completed_responses[step_id] = (
+                                f"[{result['expert_id']}]:\n{result['response']}"
+                            )
+                        except Exception as e:
+                            logging.error(f"Error en paso DAG {step_id}: {e}")
+                            completed_responses[step_id] = (
+                                f"[{step.get('expert_id', 'UNKNOWN')} ERROR]: {e}"
+                            )
+
+        return completed_responses
 
 
 # --- 3. OCKHAM SYNTHESIS & SANDBOX FIREWALL (V2.0) ---
@@ -643,12 +903,18 @@ class OckhamSynthesizer:
         self.safety_settings = vromlix.get_safety_settings()
 
     def _call_llm(self, prompt: str, temp: float) -> str:
-        max_attempts = 15
+        max_attempts = (
+            len(vromlix.key_manager.keys) if hasattr(vromlix, "key_manager") else 110
+        )
         for attempt in range(max_attempts):
             api_key = vromlix.get_api_key()
             if not api_key:
                 return "ERROR: No API Keys."
-            client = genai.Client(api_key=api_key)
+
+            # Configurar cliente para fallar rápido y evitar que Google congele el hilo
+            client = genai.Client(
+                api_key=api_key, http_options=types.HttpOptions(api_version="v1alpha")
+            )
             try:
                 response = client.models.generate_content(
                     model=self.model_id,
@@ -707,7 +973,7 @@ class OckhamSynthesizer:
         logging.info("   -> [Auditor] Evaluando integridad y forzando State Tracker...")
 
         # Extraer todas las restricciones de los expertos involucrados
-        experts = routing_data.get("experts", [])
+        experts = routing_data.get("execution_plan", [])
         all_constraints = []
         for exp in experts:
             all_constraints.extend(exp.get("constraints", []))
@@ -728,7 +994,7 @@ class SandboxFirewall:
     """
 
     def __init__(self):
-        self.sandbox_dir: Path = vromlix.paths.base / "SANDBOX"
+        self.sandbox_dir: Path = vromlix.paths.sandbox
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
 
     def _hitl_prompt(self, message: str) -> bool:
@@ -748,37 +1014,13 @@ class SandboxFirewall:
 
     def execute_if_present(self, llm_response: str) -> str:
         """
-        Escanea la respuesta en busca de código Python o JSON de OS.
+        Escanea la respuesta en busca de comandos de sistema operativo.
+        (La detección interactiva de Python ha sido delegada a La Forja).
         """
         logs = []
 
-        # 1. Detección de Código Python (Regex optimizado)
-        python_blocks = re.findall(r"```python\s*(.*?)\s*```", llm_response, re.DOTALL)
-        if python_blocks:
-            for i, code in enumerate(python_blocks):
-                if self._hitl_prompt(
-                    f"Se ha detectado un bloque de código Python ({len(code)} chars). ¿Deseas guardarlo en el SANDBOX?"
-                ):
-                    filename = input(
-                        "   📝 Ingresa el nombre del archivo (ej. script.py): "
-                    ).strip()
-                    if not filename.endswith(".py"):
-                        filename += ".py"
-
-                    # Sanitizar nombre de archivo
-                    filename = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", filename)
-                    filepath = self.sandbox_dir / filename
-
-                    try:
-                        with open(filepath, "w", encoding="utf-8") as f:
-                            f.write(code.strip() + "\n")
-                        logs.append(f"Código guardado en: {filepath}")
-                        print(f"   ✅ Guardado exitosamente en {filepath}")
-                    except Exception as e:
-                        logs.append(f"Error guardando código: {e}")
-                        print(f"   ❌ Error: {e}")
-                else:
-                    logs.append("Guardado de código cancelado por el usuario.")
+        # 1. Detección de Código Python (DESACTIVADA)
+        # Dejamos que el LLM lo envíe a La Forja a través de VROMLIX_MISSIONS
 
         # 2. Detección de OS Action (JSON Legacy)
         match = re.search(
@@ -937,7 +1179,7 @@ class DeepMemoryRetriever:
     """
 
     def __init__(self):
-        self.db_path = str(vromlix.paths.base / "vector_db" / "vromlix_memory.sqlite")
+        self.db_path = str(vromlix.paths.vector_db / "vromlix_memory.sqlite")
         embed_config = vromlix.get_secret("EMBEDDINGS")
         self.embedding_model = (
             embed_config["model_id"] if embed_config else "gemini-embedding-2-preview"
@@ -979,13 +1221,30 @@ class DeepMemoryRetriever:
             db.enable_load_extension(False)
             cursor = db.cursor()
 
+            # FASE 3: GraphRAG (1-Hop Neighborhood Traversal)
+            # Extraemos el nodo semilla y sus nodos adyacentes (contexto global)
             cursor.execute(
                 """
-                SELECT m.content, v.distance
-                FROM vromlix_vectors v
-                JOIN vromlix_metadata m ON v.id = m.id
-                WHERE v.embedding MATCH ? AND k = ?
-                ORDER BY v.distance ASC
+                WITH seed_nodes AS (
+                    SELECT m.id, m.source_file, m.network_type, m.confidence_score, v.distance
+                    FROM vromlix_vectors v
+                    JOIN vromlix_metadata m ON v.id = m.id
+                    WHERE v.embedding MATCH ? AND k = ?
+                )
+                SELECT 
+                    (SELECT group_concat(content, '\n... [NODO ADYACENTE] ...\n') 
+                     FROM (
+                         SELECT content FROM vromlix_metadata 
+                         WHERE source_file = s.source_file 
+                         AND id BETWEEN s.id - 1 AND s.id + 1 
+                         ORDER BY id ASC
+                     )
+                    ) AS expanded_content,
+                    s.network_type, 
+                    s.confidence_score, 
+                    s.distance
+                FROM seed_nodes s
+                ORDER BY s.distance ASC
             """,
                 (json.dumps(query_vector), top_k),
             )
@@ -996,9 +1255,21 @@ class DeepMemoryRetriever:
             if not results:
                 return ""
 
-            context_blocks = ["=== DEEP MEMORY CONTEXT (RAG) ==="]
-            for i, (content, distance) in enumerate(results):
-                context_blocks.append(f"--- Fragment {i + 1} ---")
+            context_blocks = ["=== DEEP MEMORY CONTEXT (HINDSIGHT W-B-O-S) ==="]
+            context_blocks.append(
+                "INSTRUCTION: Pay attention to the [NETWORK] tags. [W] = Absolute Facts/Code. [B] = Past Experiences/Chats. [O] = Opinions/Beliefs. [S] = Summaries."
+            )
+
+            for i, (content, net_type, conf_score, distance) in enumerate(results):
+                # Mapeo visual para el LLM
+                net_label = {
+                    "W": "WORLD FACT",
+                    "B": "BIOGRAPHICAL EXP",
+                    "O": f"OPINION (Conf: {conf_score})",
+                    "S": "SUMMARY",
+                }.get(net_type, "UNKNOWN")
+
+                context_blocks.append(f"--- Fragment {i + 1} [{net_label}] ---")
                 context_blocks.append(content.strip())
 
             logging.info(f"📚 RAG: {len(results)} fragmentos recuperados.")
@@ -1039,9 +1310,10 @@ class RealTimeVectorizer(threading.Thread):
             db.enable_load_extension(False)
             cursor = db.cursor()
 
+            # Las interacciones en tiempo real se guardan estrictamente como Experiencia Biográfica (B)
             cursor.execute(
-                "INSERT INTO vromlix_metadata (source_file, chunk_type, content) VALUES (?, ?, ?)",
-                ("LIVE_SESSION", "real_time_memory", self.interaction_text),
+                "INSERT INTO vromlix_metadata (source_file, chunk_type, content, network_type) VALUES (?, ?, ?, ?)",
+                ("LIVE_SESSION", "real_time_memory", self.interaction_text, "B"),
             )
             row_id = cursor.lastrowid
             cursor.execute(
@@ -1081,9 +1353,7 @@ class SubconsciousUpdater(threading.Thread):
             result = response.text.strip()
             if result != "NONE" and "<user_fact" in result:
                 # Escribir en el nuevo historial biográfico
-                history_path = (
-                    vromlix.paths.base / "docs" / "doc_roger_historial_biografico.xml"
-                )
+                history_path = vromlix.paths.docs / "doc_roger_historial_biografico.xml"
                 if history_path.exists():
                     with open(history_path, "r", encoding="utf-8") as f:
                         content = f.read()
@@ -1102,7 +1372,7 @@ class DocumentForgeAgent:
     """Agente Operario SOTA (La Forja): Genera documentos completos asíncronamente en el Sandbox."""
 
     def __init__(self, forge_prompt: str):
-        self.sandbox_dir = vromlix.paths.base / "SANDBOX"
+        self.sandbox_dir = vromlix.paths.sandbox
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         self.model = vromlix.get_model("VOLUMEN")
         self.forge_prompt = forge_prompt
@@ -1211,6 +1481,22 @@ class VromlixTerminalUI:
             "✅ Sistemas Nominales. Enjambre Multi-Agente Activo. Memoria a Corto Plazo Online.\n"
         )
 
+    def run_headless(self, task_query: str) -> str:
+        """Ejecuta una sola tarea en segundo plano (Para Benchmarks de la Industria)."""
+        logging.info("🤖 [Headless Mode] Procesando tarea de Benchmark...")
+        recent_context = self.tracker.get_recent_context(max_turns=1)
+        routing_data = self.router.determine_routing(task_query, recent_context)
+        rag_context = self.retriever.retrieve_context(task_query)
+
+        swarm_responses = self.executor.process_swarm(
+            task_query, routing_data, recent_context, rag_context, ""
+        )
+
+        final_response = self.synthesizer.synthesize(
+            task_query, swarm_responses, routing_data
+        )
+        return final_response
+
     def start(self):
         try:
             while True:
@@ -1254,6 +1540,82 @@ class VromlixTerminalUI:
                 if user_input.strip().lower() == "/limpiar":
                     self.pending_attachments = ""
                     print("🧹 Bandeja de archivos adjuntos limpiada.")
+                    continue
+
+                # --- FASE 4: AUTO-EVOLUCIÓN SEGURA (MAKER-CHECKER) ---
+                if user_input.startswith("/evolucionar "):
+                    target_expert = user_input.replace("/evolucionar ", "").strip()
+                    print(
+                        f"🧬 Iniciando evolución algorítmica para: {target_expert}..."
+                    )
+
+                    try:
+                        with open(self.loader.moe_file, "r", encoding="utf-8") as f:
+                            moe_data = json.load(f)
+
+                        expert_idx = next(
+                            (
+                                i
+                                for i, exp in enumerate(moe_data)
+                                if exp["expert_id"] == target_expert
+                            ),
+                            None,
+                        )
+                        if expert_idx is None:
+                            print(f"❌ Experto '{target_expert}' no encontrado.")
+                            continue
+
+                        expert_profile = moe_data[expert_idx]
+                        recent_logs = self.tracker.get_recent_context(max_turns=5)
+                        client = genai.Client(api_key=vromlix.get_api_key())
+
+                        # 1. MAKER (Propone la evolución)
+                        maker_prompt = f"Optimize the 'instructions' and 'constraints' of this expert based on recent friction. Return ONLY a JSON object with the updated arrays.\nPROFILE: {json.dumps(expert_profile)}\nFRICTION: {recent_logs}"
+                        maker_resp = client.models.generate_content(
+                            model=vromlix.get_model("PRECISION"),
+                            contents=maker_prompt,
+                            config=types.GenerateContentConfig(
+                                temperature=0.4, response_mime_type="application/json"
+                            ),
+                        )
+                        proposed_update = json.loads(maker_resp.text)
+
+                        # 2. CHECKER (Audita la propuesta)
+                        print("   🛡️ [Checker] Auditando la mutación propuesta...")
+                        checker_prompt = f'Compare the ORIGINAL profile with the PROPOSED update. If the proposal deletes critical core identity rules or hallucinates, return {{"approved": false}}. If it safely adds value, return {{"approved": true}}.\nORIGINAL: {json.dumps(expert_profile)}\nPROPOSED: {json.dumps(proposed_update)}'
+                        checker_resp = client.models.generate_content(
+                            model=vromlix.get_model("PRECISION"),
+                            contents=checker_prompt,
+                            config=types.GenerateContentConfig(
+                                temperature=0.0, response_mime_type="application/json"
+                            ),
+                        )
+                        verdict = json.loads(checker_resp.text)
+
+                        # 3. EJECUCIÓN
+                        if verdict.get("approved"):
+                            moe_data[expert_idx]["instructions"] = proposed_update.get(
+                                "instructions", expert_profile["instructions"]
+                            )
+                            moe_data[expert_idx]["constraints"] = proposed_update.get(
+                                "constraints", expert_profile["constraints"]
+                            )
+                            with open(self.loader.moe_file, "w", encoding="utf-8") as f:
+                                json.dump(moe_data, f, indent=2, ensure_ascii=False)
+                            print(
+                                f"   ✅ [Evolución Aprobada] El experto '{target_expert}' ha mutado exitosamente."
+                            )
+                            # Actualizar caché de embeddings para el Semantic Router
+                            self.router.expert_vectors = (
+                                self.router._load_expert_vectors()
+                            )
+                        else:
+                            print(
+                                "   ❌ [Evolución Rechazada] El Auditor detectó riesgo de pérdida de identidad. Mutación abortada."
+                            )
+
+                    except Exception as e:
+                        print(f"❌ Error en la evolución: {e}")
                     continue
 
                 # --- PREPARACIÓN DEL PROMPT ---
@@ -1363,5 +1725,18 @@ class VromlixTerminalUI:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Vromlix Prime OS")
+    parser.add_argument(
+        "--task", type=str, help="Ejecutar en modo Headless para Benchmarks"
+    )
+    args = parser.parse_args()
+
     ui = VromlixTerminalUI()
-    ui.start()
+    if args.task:
+        respuesta = ui.run_headless(args.task)
+        print("\n=== OUTPUT FINAL DEL BENCHMARK ===")
+        print(respuesta)
+    else:
+        ui.start()

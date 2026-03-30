@@ -1,5 +1,5 @@
 [project]
-name = "vromlix-core"
+name = "vromlix-cognitive-architecture"
 version = "0.1.0"
 description = "Descripción de tu proyecto"
 requires-python = ">=3.10"

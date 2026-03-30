@@ -1,3 +1,20 @@
+# Entornos y Caché
 venv/
+.venv/
+env/
 __pycache__/
+.mypy_cache/
+.ruff_cache/
 *.pyc
+*.pyo
+*.pyd
+
+# Seguridad (Protección contra fugas accidentales)
+config_api_keys_secrets.py
+.env
+.env.*
+.secrets/
+
+# OS
+.DS_Store
+Thumbs.db

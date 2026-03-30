@@ -10,8 +10,6 @@ Purpose: Environment detection, API Hot-Swapping, Agnostic Routing, Global Paths
 import os
 import sys
 import urllib.parse
-import feedparser
-import requests
 
 # Silenciar logs de C++ (gRPC/ABSL) a nivel de Sistema Operativo ANTES de cargar Google SDK
 os.environ["GRPC_VERBOSITY"] = "ERROR"
@@ -93,6 +91,9 @@ class OSINTGrounder:
     @classmethod
     def fetch_news_rss(cls, query: str, max_results: int = 30) -> list[dict[str, Any]]:
         """Extrae noticias estructuradas vía XML nativo de Google News."""
+        import feedparser
+        import requests
+
         # Forzamos comillas para exactitud: "Nombre de la Startup"
         encoded_query = urllib.parse.quote_plus(f'"{query}"')
         url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
@@ -166,11 +167,14 @@ class ActiveKeyManager:
     """
 
     def __init__(self, keys: list[str], cooldown_seconds: float = 61.0):
+        import random
+
         self.keys = keys
         self.cooldown = cooldown_seconds
         # Rastrea la última vez (timestamp) que se usó cada llave
         self.last_used = {key: 0.0 for key in keys}
-        self.current_idx = 0
+        # Empezar en un índice aleatorio para distribuir el desgaste de RPD (20/día)
+        self.current_idx = random.randint(0, max(0, len(keys) - 1)) if keys else 0
 
     def get_fresh_key(self) -> str | None:
         if not self.keys:
@@ -229,7 +233,8 @@ class VromlixOrchestrator:
         if self.is_colab:
             self.base_path = Path("/content/drive/MyDrive/VROMLIX_CORE")
         elif self.is_local:
-            self.base_path = Path("/home/rogerman/Escritorio/VROMLIX_CORE")
+            # Anclaje Absoluto SOTA: Desacopla el repo del entorno operativo
+            self.base_path = Path("/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/VROMLIX_CORE")
         else:
             self.base_path = Path("/tmp/VROMLIX_CORE")
 
@@ -247,10 +252,29 @@ class VromlixOrchestrator:
     def _init_paths(self):
         class Paths:
             base = self.base_path
-            codex_memory = self.base_path / "codex_memory"
+            sandbox = self.base_path / "00_sandbox"
+            codex_memory = self.base_path / "01_codex_memory"
+            active_memory = self.base_path / "02_active_memory"
+            prompts = self.base_path / "03_prompts"
+            scripts = self.base_path / "04_scripts"
+            docs = self.base_path / "05_docs"
+            vector_db = self.base_path / "06_vector_db"
             raw_knowledge = self.base_path / "99_deep_storage"
-            chroma_db = self.base_path / "chroma_db"
+            deep_memory = self.base_path / "98_deep_memory_corpus"
+            local_llms = Path(
+                "/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/Local_LLMs"
+            )
 
+            # --- REPOSITORIOS EXTERNOS CENTRALIZADOS (Solo los activos) ---
+            repos_externos = [
+                self.base_path.parent / "cv",
+                self.base_path.parent / "blueprints",
+                self.base_path.parent / "rlozano.intel",
+                self.base_path.parent / "vromlix-cognitive-architecture"
+            ]
+
+        # Asegurar que SANDBOX siempre exista
+        Paths.sandbox.mkdir(parents=True, exist_ok=True)
         return Paths()
 
     def _get_config_path(self):
@@ -261,8 +285,9 @@ class VromlixOrchestrator:
                 drive.mount("/content/drive")
             return "/content/drive/MyDrive/Colab Notebooks/config_api_keys_secrets.py"
         elif self.is_local:
-            return str(self.paths.base / "config_api_keys_secrets.py")
-        return "./config_api_keys_secrets.py"
+            # --- MODIFICADO: Ahora apunta a la carpeta oculta .secrets ---
+            return str(self.paths.base / ".secrets" / "config_api_keys_secrets.py")
+        return "./.secrets/config_api_keys_secrets.py"
 
     def _load_config(self):
         if not os.path.exists(self.config_path):
@@ -295,6 +320,11 @@ class VromlixOrchestrator:
             registry = getattr(self.config, "MODEL_ROUTING_REGISTRY", {})
             if key_name in registry:
                 return registry[key_name]
+
+            # --- NUEVA LÍNEA: Buscar como variable global directa ---
+            if hasattr(self.config, key_name):
+                return getattr(self.config, key_name)
+
             return getattr(self.config, "SECRETS", {}).get(key_name)
         except Exception:
             return None
@@ -315,6 +345,36 @@ class VromlixOrchestrator:
             ]
         except ImportError:
             return []
+
+    def query_local_ollm(
+        self,
+        model_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+    ) -> str:
+        """Centraliza las peticiones a la API local de Ollama para cualquier script."""
+        import requests
+
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        try:
+            # Timeout de 120s por si el modelo está "frío" y tarda en cargar a RAM
+            response = requests.post(
+                "http://localhost:11434/api/chat", json=payload, timeout=1200
+            )
+            response.raise_for_status()
+            return response.json().get("message", {}).get("content", "").strip()
+        except Exception as e:
+            logging.error(f"Fallo en API local Ollama: {e}")
+            return f"ERROR LOCAL: {e}"
 
 
 # Instancia única global
