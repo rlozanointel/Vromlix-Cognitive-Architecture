@@ -233,8 +233,13 @@ class VromlixOrchestrator:
         if self.is_colab:
             self.base_path = Path("/content/drive/MyDrive/VROMLIX_CORE")
         elif self.is_local:
-            # Anclaje Absoluto SOTA: Desacopla el repo del entorno operativo
-            self.base_path = Path("/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/VROMLIX_CORE")
+            # Anclaje Absoluto SOTA: Intenta la ruta física, si falla usa detección dinámica (útil en CI)
+            prod_base = Path("/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/VROMLIX_CORE")
+            if prod_base.exists():
+                self.base_path = prod_base
+            else:
+                # Fallback para CI/GitHub Actions: asumimos estructura de repos hermanos
+                self.base_path = Path(__file__).resolve().parents[1] / "VROMLIX_CORE"
         else:
             self.base_path = Path("/tmp/VROMLIX_CORE")
 
@@ -261,9 +266,9 @@ class VromlixOrchestrator:
             vector_db = self.base_path / "06_vector_db"
             raw_knowledge = self.base_path / "99_deep_storage"
             deep_memory = self.base_path / "98_deep_memory_corpus"
-            local_llms = Path(
-                "/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/Local_LLMs"
-            )
+            local_llms = Path("/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/Local_LLMs")
+            if not local_llms.exists():
+                local_llms = self.base_path.parent / "Local_LLMs"
 
             # --- REPOSITORIOS EXTERNOS CENTRALIZADOS (Solo los activos) ---
             repos_externos = [
