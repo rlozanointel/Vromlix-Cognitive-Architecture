@@ -1353,7 +1353,7 @@ class SubconsciousUpdater(threading.Thread):
             result = response.text.strip()
             if result != "NONE" and "<user_fact" in result:
                 # Escribir en el nuevo historial biográfico
-                history_path = vromlix.paths.docs / "doc_roger_historial_biografico.xml"
+                history_path = vromlix.paths.prompts / "sys_roger_historial_biografico.xml"
                 if history_path.exists():
                     with open(history_path, "r", encoding="utf-8") as f:
                         content = f.read()
