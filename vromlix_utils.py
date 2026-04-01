@@ -8,24 +8,51 @@ Purpose: Environment detection, API Hot-Swapping, Agnostic Routing, Global Paths
 """
 
 import os
-import sys
-import urllib.parse
-
-# Silenciar logs de C++ (gRPC/ABSL) a nivel de Sistema Operativo ANTES de cargar Google SDK
 os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GLOG_minloglevel"] = "2"
 
 import importlib.util
 import json
 import logging
+import sys
+import urllib.parse
 import re
 import time
-import warnings
+import httpx
+import feedparser
 from pathlib import Path
 from typing import Any
+from tenacity import retry, stop_after_attempt, wait_exponential
 
+
+# --- CONFIGURACIÓN DE FILTROS ---
+import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
 logging.getLogger("duckduckgo_search").setLevel(logging.ERROR)
+logging.getLogger("google.ai.generativelanguage").setLevel(logging.ERROR)
+logging.getLogger("absl").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+
+# Liniers SOTA: Ignoramos advertencias de tipos para librerías sin stubs específicos
+# pyright: reportMissingImports=false
+# mypy: ignore-missing-imports
+
+# --- LÓGICA DE CONSTANTES SOTA ---
+SOTA_DEPENDENCIES = [
+    "pydantic>=2.10.0",
+    "google-genai",
+    "sqlite-vec",
+    "duckduckgo-search",
+    "markitdown",
+    "google-api-core",
+    "google.genai",
+    "httpx",
+    "httpcore",
+    "absl",
+    "urllib3",
+    "tenacity",
+    "instructor"
+]
 
 # ==============================================================================
 # CONFIGURACIÓN GLOBAL DE LOGGING Y SILENCIADOR AFC
@@ -53,6 +80,11 @@ for logger_name in [
     "google.api_core",
     "google.genai",
     "httpx",
+# dependencies = [
+#     "google-genai",
+#     "httpx>=0.28.1",
+#     "tenacity"
+# ]
     "httpcore",
     "absl",
     "urllib3",
@@ -91,9 +123,6 @@ class OSINTGrounder:
     @classmethod
     def fetch_news_rss(cls, query: str, max_results: int = 30) -> list[dict[str, Any]]:
         """Extrae noticias estructuradas vía XML nativo de Google News."""
-        import feedparser
-        import httpx
-
         # Forzamos comillas para exactitud: "Nombre de la Startup"
         encoded_query = urllib.parse.quote_plus(f'"{query}"')
         url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
@@ -118,6 +147,26 @@ class OSINTGrounder:
         except Exception as e:
             logging.warning(f"[OSINT] Advertencia en feed RSS para '{query}': {e}")
         return results
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=False
+    )
+    def fetch_rss_summary(self, url: str) -> str:
+        """Fetch and summarize RSS feed with SOTA resilience."""
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                feed = feedparser.parse(resp.text)
+                
+                # SOTA Extraction: Title + Summary of the first 3 items
+                items = [f"{e.title}: {e.summary[:200]}" for e in feed.entries[:3]]
+                return "\n".join(items) if items else "No entries found."
+        except Exception as e:
+            print(f"   ⚠️ RSS Fail: {e}")
+            return f"RSS Error: {e}"
 
     @classmethod
     def execute_deep_research(
@@ -371,6 +420,11 @@ class VromlixOrchestrator:
         except ImportError:
             return []
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True
+    )
     def query_local_ollm(
         self,
         model_name: str,
@@ -378,9 +432,7 @@ class VromlixOrchestrator:
         user_prompt: str,
         temperature: float = 0.1,
     ) -> str:
-        """Centraliza las peticiones a la API local de Ollama para cualquier script."""
-        import httpx
-
+        """Centraliza las peticiones a la API local de Ollama para cualquier script con Resiliencia SOTA."""
         payload = {
             "model": model_name,
             "messages": [
@@ -390,16 +442,13 @@ class VromlixOrchestrator:
             "stream": False,
             "options": {"temperature": temperature},
         }
-        try:
-            # Timeout de 120s por si el modelo está "frío" y tarda en cargar a RAM
-            response = httpx.post(
-                "http://localhost:11434/api/chat", json=payload, timeout=1200
+        # Timeout de 120s por si el modelo está "frío" y tarda en cargar a RAM
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(
+                "http://localhost:11434/api/chat", json=payload
             )
             response.raise_for_status()
             return response.json().get("message", {}).get("content", "").strip()
-        except Exception as e:
-            logging.error(f"Fallo en API local Ollama: {e}")
-            return f"ERROR LOCAL: {e}"
 
 
 # Instancia única global

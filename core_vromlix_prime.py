@@ -5,24 +5,26 @@
 #     "sqlite-vec",
 #     "ddgs",
 #     "feedparser>=6.0.12",
-#     "requests>=2.32.5",
-#     "pydantic>=2.12.5"
+#     "httpx>=0.28.1",
+#     "pydantic>=2.12.5",
+#     "tenacity",
+#     "instructor"
 # ]
 # ///
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # @description Vromlix Prime V2.0: Infraestructura, Memoria a Corto Plazo y Monitor de Tokens.
 
+import json
+import logging
 import os
-import sys
+import re
 import readline  # noqa: F401
 import shutil
-import logging
-import json
-import time
 import sqlite3
+import sys
 import threading
-import re
+import time
 
 try:
     import sqlite_vec
@@ -38,13 +40,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from pydantic import BaseModel, Field
-
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential
+import instructor
 
 # --- 1. VROMLIX CENTRAL BRAIN ---
-from vromlix_utils import vromlix, OSINTGrounder
+from vromlix_utils import OSINTGrounder, vromlix
 
 
 class TokenMonitor:
@@ -353,42 +356,40 @@ class MoERouter:
             return 0.0
         return dot_product / (mag1 * mag2)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=False
+    )
     def _load_expert_vectors(self) -> dict[str, list[float]]:
-        """Carga los vectores cacheados o los genera si el MoE cambió."""
+        """Carga los vectores cacheados o los genera con Resiliencia SOTA."""
         if self.cache_path.exists():
             try:
                 with open(self.cache_path, "r", encoding="utf-8") as f:
                     cache = json.load(f)
-                    # Validar si la cantidad de expertos coincide
                     if len(cache) == len(self.moe_data):
                         return cache
             except Exception:
                 pass
 
-        # Si no hay caché válido, generamos los embeddings
-        logging.info(
-            "🧠 [Semantic Router] Generando embeddings de expertos (Cache Miss)..."
-        )
+        logging.info("🧠 [Semantic Router] Generando embeddings de expertos (Cache Miss)...")
         vectors = {}
-        try:
-            client = genai.Client(api_key=vromlix.get_api_key())
-            for exp in self.moe_data:
-                # Crear un documento semántico denso para el experto
-                doc = f"Role: {exp['expert_id']}. Mechanics: {', '.join(exp.get('mechanics', []))}. Instructions: {', '.join(exp.get('instructions', []))}."
-                response = client.models.embed_content(
-                    model=self.embed_model,
-                    contents=doc,
-                    config=types.EmbedContentConfig(
-                        task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768
-                    ),
-                )
-                vectors[exp["expert_id"]] = response.embeddings[0].values
+        api_key = vromlix.get_api_key()
+        client = genai.Client(api_key=api_key)
+        
+        for exp in self.moe_data:
+            doc = f"Role: {exp['expert_id']}. Mechanics: {', '.join(exp.get('mechanics', []))}. Instructions: {', '.join(exp.get('instructions', []))}."
+            response = client.models.embed_content(
+                model=self.embed_model,
+                contents=doc,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768
+                ),
+            )
+            vectors[exp["expert_id"]] = response.embeddings[0].values
 
-            # Guardar caché
-            with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump(vectors, f)
-        except Exception as e:
-            logging.warning(f"⚠️ Fallo al generar vectores de expertos: {e}")
+        with open(self.cache_path, "w", encoding="utf-8") as f:
+            json.dump(vectors, f)
         return vectors
 
     def determine_routing(self, user_query: str, recent_context: str) -> dict:
@@ -474,23 +475,19 @@ class MoERouter:
         )
 
         try:
-            client = genai.Client(api_key=vromlix.get_api_key())
-            response = client.models.generate_content(
-                model=self.model_id,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=RoutingResult,  # <--- LA MAGIA DE PYDANTIC AQUI
-                ),
+            api_key = vromlix.get_api_key()
+            client = instructor.from_genai(
+                genai.Client(api_key=api_key), 
+                mode=instructor.Mode.GEMINI_JSON
             )
-            self.monitor.add_usage("MoERouter", response.usage_metadata)
-
-            # La API de Google GenAI (>=1.0) ya valida y parsea el esquema en .parsed
-            if not response.parsed:
-                raise ValueError("MoE Router: El modelo no devolvió una respuesta estructurada válida.")
-
-            result: RoutingResult = response.parsed
+            
+            # Orquestación SOTA con Instructor para decisiones deterministas
+            result, raw_resp = client.chat.completions.create_with_completion(
+                model=self.model_id,
+                messages=[{"role": "user", "content": prompt}],
+                response_model=RoutingResult,
+            )
+            self.monitor.add_usage("MoERouter", raw_resp.usage_metadata)
 
             # Imprimir el razonamiento interno del Router (CoT) en la consola
             logging.info(f"🧠 [Router CoT]: {result.internal_analysis}")
@@ -703,51 +700,18 @@ class AgenticExecutor:
 
             return {"expert_id": expert_id, "response": respuesta_local}
 
-        # 4. Ejecución con Rotación Total y Thinking (Nube)
-        max_attempts = (
-            len(vromlix.key_manager.keys) if hasattr(vromlix, "key_manager") else 110
-        )
-        for attempt in range(max_attempts):
-            api_key = vromlix.get_api_key()
-            if not api_key:
-                return {"expert_id": expert_id, "response": "ERROR: No API Keys."}
-
-            # Aplicamos el mismo escudo anti-congelamiento a los Expertos del Enjambre
-            client = genai.Client(
-                api_key=api_key, http_options=types.HttpOptions(api_version="v1alpha")
-            )
+        # 4. Ejecución con Bucle de Reflexión SOTA
+        for attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model=self.model_id,
-                    contents=full_user_prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        system_instruction=final_system_instruction,
-                        safety_settings=self.safety_settings,
-                        tools=tools if tools else None,
-                        thinking_config=types.ThinkingConfig(include_thoughts=True),
-                    ),
+                res = self._call_expert_api(
+                    expert_id, final_system_instruction, full_user_prompt, tools
                 )
-                self.monitor.add_usage(expert_id, response.usage_metadata)
+                respuesta_final = res["response"]
+                pensamientos = res["thoughts"]
 
-                # Extraer pensamientos y respuesta
-                pensamientos = ""
-                respuesta_final = ""
-                if response.candidates and response.candidates[0].content.parts:
-                    for part in response.candidates[0].content.parts:
-                        if getattr(part, "thought", False):
-                            pensamientos += (
-                                f"\n[🧠 RAZONAMIENTO DEL EXPERTO]:\n{part.text}\n"
-                            )
-                        elif part.text:
-                            respuesta_final += part.text
-                else:
-                    respuesta_final = response.text
-
-                # --- FASE 3: BUCLE DE REFLEXIÓN (AUTO-CORRECCIÓN CÍCLICA) ---
+                # Validación de Firma (Signature Policy)
                 expected_sig = expert_profile.get("output_signature", "")
                 if expected_sig:
-                    # Extraer el marcador principal de la firma esperada
                     sig_marker = ""
                     if "```python" in expected_sig:
                         sig_marker = "```python"
@@ -756,20 +720,12 @@ class AgenticExecutor:
                     elif "###" in expected_sig:
                         sig_marker = expected_sig.split("\n")[0].strip()
 
-                    # Si el marcador no está en la respuesta, forzamos un reintento (Ciclo)
                     if sig_marker and sig_marker not in respuesta_final:
-                        if attempt < max_attempts - 1:
-                            logging.warning(
-                                f"🔄 [Reflexión] {expert_id} omitió la firma '{sig_marker}'. Forzando auto-corrección interna..."
-                            )
-                            # Inyectamos el regaño al final del prompt y el bucle 'for' vuelve a girar
-                            full_user_prompt += f"\n\n[SYSTEM FEEDBACK - ATTEMPT {attempt + 1} FAILED]: You hallucinated or ignored the constraints. You MUST include the exact signature '{sig_marker}' in your response. Correct your output and try again."
-                            continue
-                        else:
-                            logging.error(
-                                f"❌ [Reflexión] {expert_id} falló la auto-corrección tras múltiples intentos."
-                            )
-                # ------------------------------------------------------------
+                        logging.warning(
+                            f"🔄 [Reflexión] {expert_id} omitió signature '{sig_marker}'. Re-intentando..."
+                        )
+                        full_user_prompt += f"\n\n[SYSTEM FEEDBACK]: You MUST include the signature '{sig_marker}' in your response."
+                        continue
 
                 output_completo = (
                     f"{pensamientos}\n{respuesta_final}"
@@ -778,20 +734,50 @@ class AgenticExecutor:
                 )
                 return {"expert_id": expert_id, "response": output_completo.strip()}
             except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "503" in error_str or "quota" in error_str:
-                    logging.warning(
-                        f"⚠️ API Limit ({expert_id}). Descartando llave... ({attempt + 1}/{max_attempts})"
-                    )
-                    time.sleep(
-                        0.5
-                    )  # Micro-pausa para evitar penalización por DDoS en la IP
-                    continue
-                else:
-                    logging.error(f"❌ Error en experto {expert_id}: {e}")
-                    return {"expert_id": expert_id, "response": f"ERROR INTERNO: {e}"}
+                logging.error(f"❌ Error crítico en experto {expert_id}: {e}")
+                return {"expert_id": expert_id, "response": f"ERROR INTERNO: {e}"}
 
-        return {"expert_id": expert_id, "response": "ERROR: Timeout por cuota."}
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=15),
+        reraise=True,
+    )
+    def _call_expert_api(
+        self, expert_id: str, system_instruction: str, user_prompt: str, tools: list
+    ) -> dict:
+        """Llamada resiliente SOTA a la API con Thinking y Rotación."""
+        api_key = vromlix.get_api_key()
+        client = genai.Client(
+            api_key=api_key, http_options=types.HttpOptions(api_version="v1alpha")
+        )
+
+        response = client.models.generate_content(
+            model=self.model_id,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                system_instruction=system_instruction,
+                safety_settings=self.safety_settings,
+                tools=tools if tools else None,
+                thinking_config=types.ThinkingConfig(include_thoughts=True),
+            ),
+        )
+        self.monitor.add_usage(expert_id, response.usage_metadata)
+
+        pensamientos = ""
+        respuesta_final = ""
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if getattr(part, "thought", False):
+                    pensamientos += (
+                        f"\n[🧠 RAZONAMIENTO DEL EXPERTO]:\n{part.text}\n"
+                    )
+                elif part.text:
+                    respuesta_final += part.text
+        else:
+            respuesta_final = response.text
+
+        return {"thoughts": pensamientos, "response": respuesta_final}
 
     def process_swarm(
         self,
@@ -1356,7 +1342,9 @@ class SubconsciousUpdater(threading.Thread):
             result = response.text.strip()
             if result != "NONE" and "<user_fact" in result:
                 # Escribir en el nuevo historial biográfico
-                history_path = vromlix.paths.prompts / "sys_roger_historial_biografico.xml"
+                history_path = (
+                    vromlix.paths.prompts / "sys_roger_historial_biografico.xml"
+                )
                 if history_path.exists():
                     with open(history_path, "r", encoding="utf-8") as f:
                         content = f.read()
