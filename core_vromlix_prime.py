@@ -737,6 +737,12 @@ class AgenticExecutor:
                 logging.error(f"❌ Error crítico en experto {expert_id}: {e}")
                 return {"expert_id": expert_id, "response": f"ERROR INTERNO: {e}"}
 
+        # Fallback if reflection attempts are exhausted
+        return {
+            "expert_id": expert_id,
+            "response": f"ERROR: [{expert_id}] El experto falló al generar una respuesta con la firma requerida después de 3 intentos.",
+        }
+
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=15),
