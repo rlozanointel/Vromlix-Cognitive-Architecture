@@ -16,13 +16,13 @@ os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GLOG_minloglevel"] = "2"
 
 import importlib.util
-import time
-import re
 import json
+import logging
+import re
+import time
+import warnings
 from pathlib import Path
 from typing import Any
-import logging
-import warnings
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
 logging.getLogger("duckduckgo_search").setLevel(logging.ERROR)
@@ -92,7 +92,7 @@ class OSINTGrounder:
     def fetch_news_rss(cls, query: str, max_results: int = 30) -> list[dict[str, Any]]:
         """Extrae noticias estructuradas vía XML nativo de Google News."""
         import feedparser
-        import requests
+        import httpx
 
         # Forzamos comillas para exactitud: "Nombre de la Startup"
         encoded_query = urllib.parse.quote_plus(f'"{query}"')
@@ -103,7 +103,7 @@ class OSINTGrounder:
         }
         results = []
         try:
-            response = requests.get(url, headers=headers, timeout=10.0)
+            response = httpx.get(url, headers=headers, timeout=10.0)
             if response.status_code == 200:
                 feed = feedparser.parse(response.content)
                 for entry in feed.entries[:max_results]:
@@ -234,7 +234,9 @@ class VromlixOrchestrator:
             self.base_path = Path("/content/drive/MyDrive/VROMLIX_CORE")
         elif self.is_local:
             # Anclaje Absoluto SOTA: Intenta la ruta física, si falla usa detección dinámica (útil en CI)
-            prod_base = Path("/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/VROMLIX_CORE")
+            prod_base = Path(
+                "/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/VROMLIX_CORE"
+            )
             if prod_base.exists():
                 self.base_path = prod_base
             else:
@@ -266,7 +268,9 @@ class VromlixOrchestrator:
             vector_db = self.base_path / "06_vector_db"
             raw_knowledge = self.base_path / "99_deep_storage"
             deep_memory = self.base_path / "98_deep_memory_corpus"
-            local_llms = Path("/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/Local_LLMs")
+            local_llms = Path(
+                "/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/Local_LLMs"
+            )
             if not local_llms.exists():
                 local_llms = self.base_path.parent / "Local_LLMs"
 
@@ -275,7 +279,7 @@ class VromlixOrchestrator:
                 self.base_path.parent / "cv",
                 self.base_path.parent / "blueprints",
                 self.base_path.parent / "rlozano.intel",
-                self.base_path.parent / "vromlix-cognitive-architecture"
+                self.base_path.parent / "vromlix-cognitive-architecture",
             ]
 
         # Asegurar que SANDBOX siempre exista
@@ -301,13 +305,27 @@ class VromlixOrchestrator:
             )
             return None
         spec = importlib.util.spec_from_file_location("config_module", self.config_path)
+        if spec is None:
+            return None
+
+        if spec.loader is None:
+            logging.warning(
+                f"AVISO: No se pudo crear el spec de carga para {self.config_path}."
+            )
+            return None
+
         config = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(config)
         return config
 
     def get_model(self, role):
         # Fallback si no hay config pero se pide un rol estándar para evitar crashes
-        if not self.config and role.upper() in ["VOLUMEN", "CONSULTA", "PRIME", "REASONING"]:
+        if not self.config and role.upper() in [
+            "VOLUMEN",
+            "CONSULTA",
+            "PRIME",
+            "REASONING",
+        ]:
             return "gemini-2.0-flash-exp"
 
         attr_name = f"MODELO_{role.upper()}"
@@ -361,7 +379,7 @@ class VromlixOrchestrator:
         temperature: float = 0.1,
     ) -> str:
         """Centraliza las peticiones a la API local de Ollama para cualquier script."""
-        import requests
+        import httpx
 
         payload = {
             "model": model_name,
@@ -374,7 +392,7 @@ class VromlixOrchestrator:
         }
         try:
             # Timeout de 120s por si el modelo está "frío" y tarda en cargar a RAM
-            response = requests.post(
+            response = httpx.post(
                 "http://localhost:11434/api/chat", json=payload, timeout=1200
             )
             response.raise_for_status()
