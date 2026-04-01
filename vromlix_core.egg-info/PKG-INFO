@@ -1,5 +1,5 @@
 Metadata-Version: 2.4
-Name: vromlix-cognitive-architecture
+Name: vromlix-core
 Version: 0.1.0
 Summary: Descripción de tu proyecto
 Requires-Python: >=3.10
@@ -10,4 +10,5 @@ Requires-Dist: google-genai>=1.68.0
 Requires-Dist: pydantic>=2.12.5
 Requires-Dist: requests>=2.32.5
 Requires-Dist: lxml>=5.1.0
+Requires-Dist: vromlix-cognitive-architecture
 Dynamic: license-file

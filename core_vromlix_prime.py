@@ -486,8 +486,11 @@ class MoERouter:
             )
             self.monitor.add_usage("MoERouter", response.usage_metadata)
 
-            # La API garantiza que el JSON cumple con Pydantic
-            result = RoutingResult.model_validate_json(response.text)
+            # La API de Google GenAI (>=1.0) ya valida y parsea el esquema en .parsed
+            if not response.parsed:
+                raise ValueError("MoE Router: El modelo no devolvió una respuesta estructurada válida.")
+
+            result: RoutingResult = response.parsed
 
             # Imprimir el razonamiento interno del Router (CoT) en la consola
             logging.info(f"🧠 [Router CoT]: {result.internal_analysis}")

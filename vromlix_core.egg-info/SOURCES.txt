@@ -1,0 +1,8 @@
+LICENSE.md
+README.md
+pyproject.toml
+vromlix_core.egg-info/PKG-INFO
+vromlix_core.egg-info/SOURCES.txt
+vromlix_core.egg-info/dependency_links.txt
+vromlix_core.egg-info/requires.txt
+vromlix_core.egg-info/top_level.txt
