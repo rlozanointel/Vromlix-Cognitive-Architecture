@@ -418,8 +418,17 @@ class VromlixOrchestrator:
             "PRIME",
             "REASONING",
         ]:
-            return "gemini-2.0-flash-exp"
+            return "gemini-3.1-flash-lite-preview"
 
+        # NUEVA LÓGICA PRINCIPAL: Leer desde el registro de enrutamiento (SOTA)
+        try:
+            registry = getattr(self.config, "MODEL_ROUTING_REGISTRY", {})
+            if role.upper() in registry:
+                return registry[role.upper()]["model_id"]
+        except Exception as e:
+            logging.warning(f"Error leyendo MODEL_ROUTING_REGISTRY: {e}")
+
+        # LÓGICA LEGACY (Mantener por retrocompatibilidad)
         attr_name = f"MODELO_{role.upper()}"
         model = getattr(self.config, attr_name, None)
         if not model:
@@ -741,7 +750,7 @@ class VromlixRaptorEngine:
         try:
             client = genai.Client(api_key=api_key)
             response = client.models.embed_content(
-                model=vromlix.get_secret("EMBEDDINGS")["model_id"],
+                model=vromlix.get_model("EMBEDDINGS"),
                 contents=summary_text,
                 config=types.EmbedContentConfig(
                     task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768
