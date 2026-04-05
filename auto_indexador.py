@@ -157,7 +157,20 @@ def get_files_to_scan():
     valid_extensions = {".py", ".xml", ".md", ".json", ".txt", ".csv"}
 
     # Exclusiones estrictas para no indexar repositorios anidados ni basura
-    excluded_dirs = {"NexoContable", "00_sandbox", "venv", ".venv", "node_modules"}
+    excluded_dirs = {
+        "NexoContable",
+        "00_sandbox",
+        "venv",
+        ".venv",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+        ".git",
+        ".github",
+        "Technical_Lexicon",
+    }
     excluded_files = {
         "04_Knowledge_Index.xml",
         "04_Knowledge_Index.json",
@@ -168,30 +181,40 @@ def get_files_to_scan():
         "pyproject.toml",
     }
 
+    def is_excluded(path: Path) -> bool:
+        """Verifica si el archivo o cualquiera de sus padres está en la lista de exclusión."""
+        for part in path.parts:
+            if part in excluded_dirs or part.startswith("."):
+                # Permitir archivos ocultos si no están en excluded_dirs,
+                # pero el rglob ya filtra por nombre. Aquí somos más estrictos.
+                if part in excluded_dirs:
+                    return True
+        return False
+
     # Ahora escanea scripts, prompts, docs y codex_memory (Internos a VROMLIX_CORE)
     for folder_name in ["04_scripts", "03_prompts", "05_docs", "01_codex_memory"]:
-        if folder_name in excluded_dirs:
-            continue
         folder_path = BASE_DIR / folder_name
         if folder_path.exists():
             for f in folder_path.rglob("*"):
                 if f.is_file() and not f.name.startswith("."):
-                    if f.suffix.lower() in valid_extensions:
-                        if f.name not in excluded_files and not f.name.startswith(
-                            "index_VROMLIX_CORE_"
-                        ):
-                            files_to_scan.append((f, folder_name))
+                    if not is_excluded(f.relative_to(BASE_DIR)):
+                        if f.suffix.lower() in valid_extensions:
+                            if f.name not in excluded_files and not f.name.startswith(
+                                "index_VROMLIX_CORE_"
+                            ):
+                                files_to_scan.append((f, folder_name))
 
     # Escanear los Repositorios Externos Centralizados desde Utils
     for repo_path in vromlix.paths.repos_externos:
         if repo_path.exists():
-            for f in repo_path.iterdir():
+            for f in repo_path.rglob("*"):  # Usar rglob para consistencia
                 if f.is_file() and not f.name.startswith("."):
-                    if (
-                        f.suffix.lower() in valid_extensions
-                        and f.name not in excluded_files
-                    ):
-                        files_to_scan.append((f, f"REPO_{repo_path.name.upper()}"))
+                    if not is_excluded(f.relative_to(repo_path.parent)):
+                        if (
+                            f.suffix.lower() in valid_extensions
+                            and f.name not in excluded_files
+                        ):
+                            files_to_scan.append((f, f"REPO_{repo_path.name.upper()}"))
 
     # Escanear archivos sueltos en la raíz de VROMLIX_CORE
     for f in BASE_DIR.iterdir():
