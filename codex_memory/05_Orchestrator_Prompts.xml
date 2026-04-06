@@ -1,7 +1,7 @@
 
 <?xml version="1.0" encoding="UTF-8" ?>
 <orchestrator_prompts version="3.0.0">
-    <reasoning>Este archivo gestiona el enrutamiento de expertos, la síntesis de respuestas y la auditoría forense para el sistema Vromlix Prime utilizando mensajes estructurados en XML para una mejor comprensión del LLM.</reasoning>
+    <reasoning>This file manages expert routing, response synthesis, and forensic auditing for the Vromlix Prime system using structured XML messages for better LLM understanding.</reasoning>
 
     <prompt id="moe_router">
         <![CDATA[
@@ -50,7 +50,7 @@
     <role>Vromlix Chief Editor (Ockham's Razor)</role>
     <task>You have received analyses from multiple specialized internal agents regarding the user's query. Your job is to FUSE them into a single, highly coherent, and dense master response.</task>
     
-    <important_context>Some expert inputs include a block labeled [🧠 RAZONAMIENTO DEL EXPERTO] or [🧠 EXPERT REASONING]. This is their internal 'Chain of Thought'.</important_context>
+    <important_context>Some expert inputs include a block labeled [🧠 EXPERT REASONING]. This is their internal 'Chain of Thought'.</important_context>
     
     <rules>
         <rule>READ AND ANALYZE the reasoning blocks to deeply understand the underlying logic behind their conclusions.</rule>
