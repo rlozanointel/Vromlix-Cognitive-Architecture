@@ -17,7 +17,7 @@
 # ///
 #!/usr/bin/env -S uv run
 # -*- coding: utf-8 -*-
-# @description Vromlix Prime V2.0: Infraestructura, Memoria a Corto Plazo y Monitor de Tokens.
+# @description Vromlix Prime V2.0: Infrastructure, Short-Term Memory and Token Monitor.
 
 import json
 import logging
@@ -36,19 +36,18 @@ try:
     HAS_SQLITE_VEC = True
 except ImportError:
     HAS_SQLITE_VEC = False
-    logging.warning(
-        "⚠️ sqlite-vec no está instalado. La memoria profunda (RAG) estará desactivada."
-    )
+    logging.warning("⚠️ sqlite-vec not installed. Deep memory (RAG) will be disabled.")
 import concurrent.futures
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+import instructor
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
-import instructor
 
 # --- 1. VROMLIX CENTRAL BRAIN ---
 from vromlix_utils import OSINTGrounder, vromlix
@@ -99,10 +98,10 @@ class VromlixContextLoader:
 
     def __init__(self):
         self.base_path: Path = vromlix.paths.base
-        self.codex_path: Path = vromlix.paths.codex_memory
+        self.config_path: Path = vromlix.paths.config_xml
 
-        self.logic_file: Path = self._find_file("00_System_Operating_Logic.xml")
-        self.profile_file: Path = self._find_file("01_Dynamic_Profile.xml")
+        self.logic_file: Path = self._find_file("system_operating_logic.xml")
+        self.profile_file: Path = self._find_file("dynamic_profile.xml")
         self.moe_file: Path = self._find_file("02_MoE_Routing.json")
         self.repo_file: Path = self._find_file("12_Code_Repository.md")
         self.prompts_file: Path = self._find_file("05_Orchestrator_Prompts.xml")
@@ -126,11 +125,11 @@ class VromlixContextLoader:
         return prompts
 
     def _find_file(self, filename: str) -> Path:
-        """Busca el archivo en la raíz y en codex_memory."""
+        """Busca el archivo en la raíz y en config_xml."""
         if (self.base_path / filename).exists():
             return self.base_path / filename
-        if (self.codex_path / filename).exists():
-            return self.codex_path / filename
+        if (self.config_path / filename).exists():
+            return self.config_path / filename
         return self.base_path / filename
 
     def _read_file(self, filepath: Path) -> str:
@@ -194,71 +193,64 @@ You are a CONSULTATIVE Senior Architect. DO NOT generate code patches proactivel
 class SessionTracker:
     """
     Gestiona la memoria a corto plazo (Short-Term Memory) de la sesión actual.
-    Escribe los logs en Markdown y lee los últimos turnos para evitar amnesia.
+    Ahora utiliza SQLite para mayor eficiencia y compatibilidad.
     """
 
     def __init__(self):
-        self.logs_dir: Path = vromlix.paths.active_memory / "sessions"
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        # Importar el gestor de sesiones SQLite
+        from chat_session_manager import ChatSessionManager
 
-        self.session_id: str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_file: Path = self.logs_dir / f"session_{self.session_id}.md"
-        self._init_log()
+        self.manager = ChatSessionManager()
+        self.session_id = None
 
-    def _init_log(self) -> None:
-        """Inicializa el archivo Markdown de la sesión."""
-        try:
-            with open(self.session_file, "w", encoding="utf-8") as f:
-                f.write("# 🧠 VROMLIX PRIME: SESSION LOG\n")
-                f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"**Session ID:** {self.session_id}\n\n---\n\n")
-            logging.info(f"📝 Sesión iniciada: {self.session_file.name}")
-        except Exception as e:
-            logging.error(f"Fallo al inicializar el log de sesión: {e}")
+    def start_session(self, model: str = "default", context: str = "") -> str:
+        """Inicia una nueva sesión usando SQLite."""
+        self.session_id = self.manager.create_session(model, context)
+        return self.session_id
 
-    def log_interaction(self, role: str, content: str) -> None:
-        """Registra un turno de la conversación (Usuario o Vromlix)."""
-        try:
-            with open(self.session_file, "a", encoding="utf-8") as f:
-                f.write(f"### {role.upper()}\n{content}\n\n")
-        except Exception as e:
-            logging.error(f"Fallo al escribir en el log: {e}")
+    def log_interaction(
+        self, role: str, content: str, tokens: Optional[int] = None
+    ) -> None:
+        """Registra un turno en la base de datos SQLite."""
+        if self.session_id:
+            self.manager.add_message(self.session_id, role, content, tokens)
 
     def get_recent_context(self, max_turns: int = 5) -> str:
         """
-        Lee el archivo de sesión y extrae los últimos 'max_turns' (pares de Q/A)
-        para inyectarlos como Memoria a Corto Plazo.
+        Obtiene los últimos mensajes de la sesión desde SQLite.
         """
-        if not self.session_file.exists():
+        if not self.session_id:
             return ""
 
         try:
-            with open(self.session_file, "r", encoding="utf-8") as f:
-                content = f.read()
+            messages = self.manager.get_session_messages(self.session_id)
+            # Tomar los últimos 'max_turns' mensajes
+            recent_messages = (
+                messages[-max_turns * 2 :]
+                if len(messages) > max_turns * 2
+                else messages
+            )
 
-            # Dividir el documento por los encabezados de rol
-            blocks = re.split(r"(?=### USER|### VROMLIX)", content)
+            context_parts = []
+            for msg in recent_messages:
+                role_symbol = "👤" if msg["role"] == "user" else "🤖"
+                context_parts.append(f"{role_symbol} {msg['content']}")
 
-            # Filtrar solo los bloques de interacción (ignorando el header del archivo)
-            interactions = [
-                b.strip()
-                for b in blocks
-                if b.startswith("### USER") or b.startswith("### VROMLIX")
-            ]
-
-            if not interactions:
-                return ""
-
-            # Tomar los últimos N bloques (max_turns * 2 porque es pregunta y respuesta)
-            recent_blocks = interactions[-(max_turns * 2) :]
-
-            context_str = "=== RECENT CONVERSATION HISTORY (SHORT-TERM MEMORY) ===\n"
-            context_str += "\n\n".join(recent_blocks)
-            return context_str
-
+            return "\n\n".join(context_parts)
         except Exception as e:
-            logging.error(f"Fallo al leer el contexto reciente: {e}")
+            logging.error(f"Error obteniendo contexto reciente: {e}")
             return ""
+
+    def _init_log(self) -> None:
+        """Método legacy para compatibilidad."""
+        pass
+
+    def end_session(self) -> str:
+        """Cierra la sesión actual en SQLite."""
+        if self.session_id:
+            self.manager.close_session(self.session_id)
+            self.session_id = None
+        return ""
 
     def append_state_tracker(
         self, focus: str, locked: str, stack: str, friction: str, loop: str
@@ -276,8 +268,14 @@ class SessionTracker:
 ::: END_TRACKER :::
 """
         try:
-            with open(self.session_file, "a", encoding="utf-8") as f:
-                f.write(tracker.strip() + "\n\n---\n\n")
+            # Log state tracker as a system message in SQLite
+            if self.session_id:
+                self.manager.add_message(
+                    self.session_id,
+                    "system",
+                    tracker.strip(),
+                    metadata={"type": "state_tracker"},
+                )
         except Exception as e:
             logging.error(f"Fallo al escribir el tracker: {e}")
 
@@ -577,8 +575,8 @@ def leer_lineas_de_archivo(
         target_path = Path(vromlix.paths.base) / filepath
 
         if not target_path.exists() or not target_path.is_file():
-            # Buscar en codex_memory como fallback
-            target_path = Path(vromlix.paths.codex_memory) / filepath
+            # Buscar en config_xml como fallback
+            target_path = Path(vromlix.paths.config_xml) / filepath
             if not target_path.exists():
                 return f"[ERROR TOOL]: El archivo {filepath} no existe."
 
@@ -1177,7 +1175,7 @@ class DeepMemoryRetriever:
     """
 
     def __init__(self):
-        self.db_path = str(vromlix.paths.vector_db / "vromlix_memory.sqlite")
+        self.db_path = str(vromlix.paths.databases / "vromlix_memory.sqlite")
         embed_config = vromlix.get_secret("EMBEDDINGS")
         self.embedding_model = (
             embed_config["model_id"] if embed_config else "gemini-embedding-2-preview"
@@ -1432,7 +1430,7 @@ class DocumentForgeAgent:
 
     def _find_file(self, filename: str) -> Path | None:
         for root, _, files in os.walk(vromlix.paths.base):
-            if "venv" in root or ".git" in root or "vector_db" in root:
+            if "venv" in root or ".git" in root or "databases" in root:
                 continue
             if filename in files:
                 return Path(root) / filename

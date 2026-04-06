@@ -19,11 +19,11 @@
 # ]
 # ///
 # -*- coding: utf-8 -*-
-# @description Consolidación de Memoria RAPTOR (v1.0) - SOTA Wrapper.
+# @description RAPTOR Memory Consolidation (v1.0) - SOTA Wrapper.
 
 import sys
 
-# Fix: Asegurar que el motor encuentre vromlix_utils en el root de la partición/repositorio
+# Fix: Ensure the engine finds vromlix_utils in the root of the partition/repository
 VROMLIX_ROOT = "/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/VROMLIX_CORE"
 if VROMLIX_ROOT not in sys.path:
     sys.path.append(VROMLIX_ROOT)

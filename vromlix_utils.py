@@ -1,5 +1,24 @@
 #!/usr/bin/env -S uv run
 # -*- coding: utf-8 -*-
+# /// script
+# dependencies = [
+#   "pydantic>=2.12.5",
+#   "google-genai>=1.68.0",
+#   "instructor>=1.7.0",
+#   "tenacity>=9.0.0",
+#   "httpx>=0.28.1",
+#   "numpy>=2.2.6",
+#   "sqlite-vec>=0.1.9",
+#   "feedparser>=6.0.12",
+#   "duckduckgo-search>=8.1.1",
+#   "markitdown>=0.0.1a4",
+#   "lxml>=5.1.0",
+#   "tqdm>=4.67.3",
+#   "google-api-core",
+#   "urllib3",
+#   "jsonref",
+# ]
+# ///
 # @description Este módulo orquesta el entorno, gestiona rutas globales y filtra logs para optimizar la ejecución de servicios en Vromlix.
 """
 VROMLIX UTILS - Centralized Orchestrator v3.0.2
@@ -352,14 +371,23 @@ class VromlixOrchestrator:
         class Paths:
             base = self.base_path
             sandbox = self.base_path / "00_sandbox"
-            codex_memory = self.base_path / "01_codex_memory"
+            config = self.base_path / "01_config"
+            config_xml = self.base_path / "01_config/xml"
+            config_json = self.base_path / "01_config/json"
             active_memory = self.base_path / "02_active_memory"
             prompts = self.base_path / "03_prompts"
             scripts = self.base_path / "04_scripts"
             docs = self.base_path / "05_docs"
-            vector_db = self.base_path / "06_vector_db"
-            raw_knowledge = self.base_path / "99_deep_storage"
-            deep_memory = self.base_path / "98_deep_memory_corpus"
+            databases = self.base_path / "06_databases"
+            projects = self.base_path / "07_projects"
+            tests = self.base_path / "08_tests"
+            shell_scripts = self.base_path / "09_shell_scripts"
+            deep_storage = self.base_path / "99_deep_storage"
+
+            # --- PROYECTOS CENTRALIZADOS ---
+            apeiron = self.base_path / "07_projects/01_Apeiron"
+            icatmor = self.base_path / "07_projects/02_ICATMOR"
+
             local_llms = Path(
                 "/media/rogerman/14befb81-4210-4134-a9a0-0ee76166e483/Local_LLMs"
             )
@@ -411,29 +439,42 @@ class VromlixOrchestrator:
         return config
 
     def get_model(self, role):
+        # Mapeo SOTA: Roles abstractos a llaves del registro
+        role_map = {
+            "PRIME": "PRECISION",
+            "CONSULTA": "VOLUMEN",
+            "REASONING": "PRECISION",
+            "INDEXER": "VOLUMEN",
+        }
+        normalized_role = role_map.get(role.upper(), role.upper())
+
         # Fallback si no hay config pero se pide un rol estándar para evitar crashes
-        if not self.config and role.upper() in [
+        if not self.config and normalized_role in [
             "VOLUMEN",
-            "CONSULTA",
-            "PRIME",
-            "REASONING",
+            "PRECISION",
+            "MASIVO",
         ]:
             return "gemini-3.1-flash-lite-preview"
 
         # NUEVA LÓGICA PRINCIPAL: Leer desde el registro de enrutamiento (SOTA)
         try:
             registry = getattr(self.config, "MODEL_ROUTING_REGISTRY", {})
-            if role.upper() in registry:
-                return registry[role.upper()]["model_id"]
+            if normalized_role in registry:
+                return registry[normalized_role]["model_id"]
         except Exception as e:
             logging.warning(f"Error leyendo MODEL_ROUTING_REGISTRY: {e}")
 
         # LÓGICA LEGACY (Mantener por retrocompatibilidad)
-        attr_name = f"MODELO_{role.upper()}"
+        attr_name = f"MODELO_{normalized_role}"
         model = getattr(self.config, attr_name, None)
         if not model:
+            # Reintentar con el rol original si no hubo mapeo útil
+            attr_name_orig = f"MODELO_{role.upper()}"
+            model = getattr(self.config, attr_name_orig, None)
+
+        if not model:
             raise ValueError(
-                f"HARD STOP: El modelo para el rol '{role}' no está definido."
+                f"HARD STOP: El modelo para el rol '{role}' (mapeado a '{normalized_role}') no está definido."
             )
         return model
 
@@ -447,6 +488,12 @@ class VromlixOrchestrator:
 
     def get_secret(self, key_name: str):
         try:
+            # Lógica de rotación SOTA para llaves de Gemini
+            if key_name == "GEMINI_API_KEY" and hasattr(self, "key_manager"):
+                fresh_key = self.key_manager.get_fresh_key()
+                if fresh_key:
+                    return fresh_key
+
             registry = getattr(self.config, "MODEL_ROUTING_REGISTRY", {})
             if key_name in registry:
                 return registry[key_name]
@@ -661,8 +708,8 @@ class VromlixRaptorEngine:
     ) -> tuple:
         # Importación perezosa SOTA: Solo si se requiere clusterización
         try:
-            import umap
-            from sklearn.mixture import GaussianMixture
+            import umap  # type: ignore
+            from sklearn.mixture import GaussianMixture  # type: ignore
         except ImportError:
             logging.error(
                 "❌ [RAPTOR] Error: 'umap-learn' o 'scikit-learn' no instalados. Instálalos para usar consolidación."
