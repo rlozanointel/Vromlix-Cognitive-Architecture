@@ -630,6 +630,10 @@ class VromlixOrchestrator:
 
                 model_path = self.paths.local_llms / model_name
                 if not model_path.exists():
+                    # Fallback SOTA: Intentar en la carpeta models interna si la externa falla
+                    model_path = self.base_path / "models" / model_name
+
+                if not model_path.exists():
                     raise FileNotFoundError(f"Local model not found: {model_path}")
 
                 logging.info(f"🚀 [EDGE COMPUTE] Loading {model_name} directly into RAM...")
