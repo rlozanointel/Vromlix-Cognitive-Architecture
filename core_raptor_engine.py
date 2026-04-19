@@ -158,14 +158,12 @@ class VromlixRaptorEngine:
         2. Omisión de entidades técnicas clave (nombres de librerías, algoritmos, métricas).
         3. Resumen que no aporta más valor que la suma de sus partes.
         """
-        user_prompt = (
-            f"ORIGINAL CHUNKS:\n{original_chunks}\n\nPROPOSED SUMMARY:\n{summary.model_dump_json()}"
-        )
+        user_prompt = f"ORIGINAL CHUNKS:\n{original_chunks}\n\nPROPOSED SUMMARY:\n{summary.text}"
 
         return vromlix.query_universal_llm(
             system_prompt=sys_prompt,
             user_prompt=user_prompt,
-            role="PRECISION",
+            role="CONSOLIDATOR",
             response_model=RaptorAudit,
         )
 
@@ -190,7 +188,7 @@ class VromlixRaptorEngine:
             summary = vromlix.query_universal_llm(
                 system_prompt=sys_prompt,
                 user_prompt=f"<ingestion_payload>\n{payload}\n</ingestion_payload>",
-                role="VOLUMEN",
+                role="CONSOLIDATOR",
                 response_model=RaptorSummaryNode,
             )
 
