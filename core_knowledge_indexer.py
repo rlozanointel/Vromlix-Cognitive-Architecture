@@ -242,9 +242,7 @@ class VromlixKnowledgeIndexer:
             # Reusing the XML/MD chunking logic
             return self._chunk_content_sota(content, filepath)
         except Exception as e:
-            # Silenciar errores de MarkItDown para evitar saturar output
-            if "MissingDependencyException" not in str(e):
-                logging.info("MarkItDown issue")
+            logging.error(f"❌ MarkItDown error for {filepath}: {e}")
             return []
 
     def _chunk_content_sota(self, content: str, filepath: str) -> list[str]:
