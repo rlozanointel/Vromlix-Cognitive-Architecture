@@ -13,11 +13,11 @@
 """
 Vromlix Prime V2.0 — CLI Orchestrator (Facade Entry Point)
 This file is the CLI entry point. All heavy logic is split into sub-modules:
-  - prime_models.py   : Shared protocols and Pydantic models
-  - prime_memory.py   : TokenMonitor, VromlixContextLoader, SessionTracker
-  - prime_router.py   : MoERouter, leer_lineas_de_archivo
-  - prime_executor.py : AgenticExecutor, OckhamSynthesizer, SandboxFirewall
-  - prime_threads.py  : DeepMemoryRetriever, RealTimeVectorizer,
+  - prime.models.py   : Shared protocols and Pydantic models
+  - prime.memory.py   : TokenMonitor, VromlixContextLoader, SessionTracker
+  - prime.router.py   : MoERouter, leer_lineas_de_archivo
+  - prime.executor.py : AgenticExecutor, OckhamSynthesizer, SandboxFirewall
+  - prime.threads.py  : DeepMemoryRetriever, RealTimeVectorizer,
                         SubconsciousUpdater, DocumentForgeAgent
 """
 
@@ -28,26 +28,26 @@ import re
 import sys
 from pathlib import Path
 
-from prime_executor import (
+from prime.executor import (
     AgenticExecutor,
     OckhamSynthesizer,
     SandboxFirewall,
 )
-from prime_memory import (
+from prime.memory import (
     SessionTracker,
     TokenMonitor,
     VromlixContextLoader,
 )
 
 # ── Sub-module imports (Facade pattern — backward compatibility preserved) ──
-from prime_models import (
+from prime.models import (
     ExecutionStep,
     RoutingResult,
     SimulatedPath,
     VromlixBackend,
 )
-from prime_router import MoERouter, leer_lineas_de_archivo
-from prime_threads import (
+from prime.router import MoERouter, leer_lineas_de_archivo
+from prime.threads import (
     DeepMemoryRetriever,
     DocumentForgeAgent,
     RealTimeVectorizer,
