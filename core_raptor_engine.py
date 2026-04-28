@@ -3,16 +3,17 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "tenacity>=9.0.0",
-#     "httpx>=0.28.1",
-#     "instructor>=1.7.0",
-#     "google-genai>=1.68.0",
-#     "pydantic>=2.12.5",
 #     "sqlite-vec>=0.1.3",
 #     "scikit-learn>=1.5.0",
 #     "scikit-learn-intelex",
 #     "umap-learn>=0.5.11",
 #     "numpy>=1.24.0",
 #     "jsonref",
+#     "pydantic>=2.12.5",
+#     "sumy>=0.11.0",
+#     "yake>=0.4.8",
+#     "nltk>=3.9.1",
+#     "llama-cpp-python>=0.2.56"
 # ]
 # ///
 
@@ -28,9 +29,23 @@ import sys
 import warnings
 from pathlib import Path
 
+import nltk
 import numpy as np
+import yake
 from pydantic import BaseModel, Field
+from sumy.nlp.stemmers import Stemmer
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.summarizers.lex_rank import LexRankSummarizer
+from sumy.utils import get_stop_words
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+try:
+    nltk.data.find("tokenizers/punkt")
+    nltk.data.find("tokenizers/punkt_tab")
+except LookupError:
+    nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
 
 sys.path.append(str(Path(__file__).parents[1]))
 from vromlix_utils import vromlix
@@ -150,89 +165,68 @@ class VromlixRaptorEngine:
         optimal_k_idx = np.argmin(bics)
         return k_range[optimal_k_idx], models[optimal_k_idx].predict(reduced_embeddings)
 
-    def audit_summary(self, summary: RaptorSummaryNode, original_chunks: list[str]) -> RaptorAudit:
-        """Fase Checker: El Auditor Forense valida la calidad del resumen."""
-        # FIX SOTA: Polimorfismo total para manejar Pydantic vs VromlixResponse
-        if hasattr(summary, "model_dump_json"):
-            summary_text = summary.model_dump_json()
-        elif hasattr(summary, "text"):
-            summary_text = summary.text
-        else:
-            summary_text = str(summary)
+    def audit_summary(self, summary: RaptorSummaryNode) -> RaptorAudit:
+        """Fase Checker: Validacion por Reglas Duras (Sin LLM)."""
+        texto = summary.comprehensive_summary
 
-        sys_prompt = """
-        Eres el Vromlix Forensic Auditor. Tu misión es RECHAZAR resúmenes mediocres.
-        CRITERIOS DE RECHAZO:
-        1. Uso de lenguaje poético o vago ("un viaje fascinante", "explorando horizontes").
-        2. Omisión de entidades técnicas clave (nombres de librerías, algoritmos, métricas).
-        3. Resumen que no aporta más valor que la suma de sus partes.
-        """
-        user_prompt = f"ORIGINAL CHUNKS:\n{original_chunks}\n\nPROPOSED SUMMARY:\n{summary_text}"
+        # Regla 1: Longitud
+        if len(texto) < 50:
+            return RaptorAudit(
+                approved=False,
+                feedback="Rechazado: El resumen es demasiado corto para aportar valor.",
+            )
 
-        res = vromlix.query_universal_llm(
-            system_prompt=sys_prompt,
-            user_prompt=user_prompt,
-            role="CONSOLIDATOR",
-            response_model=RaptorAudit,
+        # Regla 2: Entidades
+        entidades_encontradas = sum(
+            1 for e in summary.extracted_entities if e.lower() in texto.lower()
         )
+        if len(summary.extracted_entities) > 0 and entidades_encontradas == 0:
+            feedback = (
+                "Rechazado: El resumen no menciona ninguna de las entidades clave detectadas."
+            )
+            return RaptorAudit(approved=False, feedback=feedback)
 
-        # FIX SOTA: Manejar fallos de validación del Auditor (si devuelve VromlixResponse)
-        if isinstance(res, RaptorAudit):
-            return res
-
-        # Si falló la validación estructurada, intentamos parsear el texto del fallback
-        raw_text = res.text if hasattr(res, "text") else str(res)
-        approved = any(x in raw_text.upper() for x in ["APROBADO", "APPROVED", "TRUE"])
-        return RaptorAudit(approved=approved, feedback=raw_text)
+        return RaptorAudit(approved=True, feedback="Aprobado por heurística.")
 
     @retry(
         stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True
     )
     def generate_refined_summary(self, chunks: list[str]) -> RaptorSummaryNode:
-        """Fase Maker: Genera y refina el resumen hasta que el Auditor lo apruebe."""
-        payload = "\n".join([f"CHUNK_{str(i + 1).zfill(2)}: {c}" for i, c in enumerate(chunks)])
-        feedback = ""
+        """Fase Maker: Generación Extractiva (Sin LLM)."""
+        full_text = " ".join(chunks)
 
-        for attempt in range(3):
-            sys_prompt = (
-                "You are an expert-level Knowledge Consolidation Engine (RAPTOR). "
-                "Synthesize this cluster into a BRIEF, high-density parent node. "
-                "CRITICAL: Use maximum 3 sentences for the comprehensive_summary."
-            )
-            if feedback:
-                sys_prompt += f"\n\nAUDITOR FEEDBACK (FIX THIS): {feedback}"
+        # 1. Extraer entidades clave (YAKE)
+        kw_extractor = yake.KeywordExtractor(lan="es", n=2, dedupLim=0.9, top=5, features=None)
+        keywords = kw_extractor.extract_keywords(full_text)
+        entities = [kw[0] for kw in keywords]
 
-            # 1. Generar (Maker)
-            summary = vromlix.query_universal_llm(
-                system_prompt=sys_prompt,
-                user_prompt=f"<ingestion_payload>\n{payload}\n</ingestion_payload>",
-                role="CONSOLIDATOR",
-                response_model=RaptorSummaryNode,
-            )
+        cluster_theme = " | ".join(entities[:3]).upper() if entities else "CLUSTER_SIN_TEMA"
 
-            # FIX SOTA: Si el Maker falló en devolver JSON, lo envolvemos para el Auditor
-            if not isinstance(summary, RaptorSummaryNode):
-                summary = RaptorSummaryNode(
-                    cluster_theme="Auto-Generated Recovery",
-                    comprehensive_summary=(
-                        summary.text if hasattr(summary, "text") else str(summary)
-                    ),
-                    extracted_entities=[],
-                    critical_claims=[],
-                )
+        # 2. Resumir (Sumy LexRank)
+        parser = PlaintextParser.from_string(full_text, Tokenizer("spanish"))
+        summarizer = LexRankSummarizer(Stemmer("spanish"))
+        summarizer.stop_words = get_stop_words("spanish")
 
-            # 2. Auditar (Checker)
-            audit = self.audit_summary(summary, chunks)
+        sentences = summarizer(parser.document, sentences_count=3)
+        comprehensive_summary = " ".join(str(s) for s in sentences)
 
-            if audit.approved:
-                return summary
+        summary = RaptorSummaryNode(
+            cluster_theme=cluster_theme,
+            comprehensive_summary=comprehensive_summary,
+            extracted_entities=entities,
+            critical_claims=[],
+        )
 
-            print(
-                f"\n      ⚠️ Resumen rechazado (Intento {attempt + 1}). Feedback: {audit.feedback}"
-            )
-            feedback = audit.feedback
+        # 3. Auditar (Checker)
+        audit = self.audit_summary(summary)
 
-        return summary  # Fallback al último si agota intentos
+        if not audit.approved:
+            print(f"\n      ⚠️ Resumen rechazado. Feedback: {audit.feedback}")
+            # Fallback simple: extraer más contexto
+            sentences = summarizer(parser.document, sentences_count=5)
+            summary.comprehensive_summary = " ".join(str(s) for s in sentences)
+
+        return summary
 
     @retry(
         stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True
