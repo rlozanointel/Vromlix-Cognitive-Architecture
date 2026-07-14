@@ -8,7 +8,6 @@ import functools
 import logging
 import re
 import threading
-import xml.etree.ElementTree as ET
 from hashlib import md5
 from pathlib import Path
 
@@ -61,7 +60,7 @@ class TokenMonitor:
 
 @functools.lru_cache(maxsize=64)
 class VromlixContextLoader:
-    """Loads and merges immutable configuration files with intelligent caching."""
+    """Loads and merges immutable configuration files from SQLite with fallback."""
 
     def __init__(self):
         self._file_cache: dict[str, tuple[str, float]] = {}
@@ -69,17 +68,12 @@ class VromlixContextLoader:
         self._prompt_hash: str = ""
         self.cache_ttl_seconds = 300  # 5 minutes
         self.base_path: Path = vromlix.paths.base
-        self.prompts_path: Path = vromlix.paths.prompts
-        self.logic_file: Path = self._find_file("system_operating_logic.xml")
-        self.profile_file: Path = self._find_file("dynamic_profile.xml")
-        self.moe_file: Path = self._find_file("moe_routing.json")
+        self.db_path: Path = vromlix.paths.databases / "vromlix_master_brain.sqlite"
         self.repo_file: Path = self._find_file("Project_Atlas.md")
-        self.prompts_file: Path = self._find_file("orchestrator_prompts.xml")
 
     def _find_file(self, filename: str) -> Path:
         for path in [
             self.base_path,
-            self.prompts_path,
             vromlix.paths.config_json,
             vromlix.paths.docs,
         ]:
@@ -89,18 +83,52 @@ class VromlixContextLoader:
 
     def load_system_prompts(self) -> dict:
         prompts: dict[str, str] = {}
-        if not self.prompts_file.exists():
-            logging.error(f"CRITICAL: {self.prompts_file.name} not found.")
-            return prompts
+        if not self.db_path.exists():
+            logging.info(
+                "ℹ️ Running in DEMO mode (Master Brain database not found). Loading mock system prompts."
+            )
+            return {
+                "moe_router": "Demo Router: Analyze user query and route it.",
+                "ockham_fusion": "Demo Fusion: Summarize inputs in Spanish.",
+                "ockham_auditor": "Demo Auditor: Enforce guidelines and trackers.",
+                "subconscious_profiler": "Demo Profiler: Extract user facts.",
+                "document_forge": "Demo Forge: Write file contents.",
+                "osint_synthesis": "Demo OSINT: Synthesize search results.",
+            }
         try:
-            tree = ET.parse(self.prompts_file)
-            for prompt_elem in tree.getroot().findall("prompt"):
-                p_id, p_text = prompt_elem.get("id"), prompt_elem.text
-                if p_id and p_text:
-                    prompts[p_id] = p_text.strip()
+            import sqlite3
+
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name, instructions FROM protocols WHERE name LIKE 'orchestrator_%'"
+                )
+                for name, instructions in cursor.fetchall():
+                    p_id = name.replace("orchestrator_", "")
+                    prompts[p_id] = instructions
         except Exception as e:
-            logging.error(f"Error parsing XML prompts: {e}")
+            logging.error(f"Error loading system prompts from SQLite: {e}")
         return prompts
+
+    def load_moe_routing(self) -> str:
+        if not self.db_path.exists():
+            # For public repo demo, attempt to load local file if exists
+            local_moe = self.base_path / "03_prompts" / "moe_routing.json"
+            if local_moe.exists():
+                return self._read_file(local_moe)
+            return "[]"
+        try:
+            import sqlite3
+
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT content FROM user_profile WHERE section = 'moe_routing'")
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
+        except Exception as e:
+            logging.error(f"Error loading MoE routing from SQLite: {e}")
+        return "[]"
 
     def _read_file_cached(self, filepath: Path) -> str:
         mtime = filepath.stat().st_mtime if filepath.exists() else 0.0
@@ -118,14 +146,9 @@ class VromlixContextLoader:
             return ""
 
     def _calculate_prompt_hash(self) -> str:
-        hash_input = "".join(
-            [
-                str(p.stat().st_mtime)
-                for p in [self.logic_file, self.profile_file, self.moe_file]
-                if p.exists()
-            ]
-        )
-        return md5(hash_input.encode()).hexdigest()
+        if self.db_path.exists():
+            return md5(str(self.db_path.stat().st_mtime).encode()).hexdigest()
+        return "demo_hash"
 
     def _compress_prompt(self, prompt: str) -> str:
         compressed = re.sub(r"\n\s*\n", "\n", prompt)
@@ -139,16 +162,43 @@ class VromlixContextLoader:
         current_hash = self._calculate_prompt_hash()
         if self._master_prompt_cache is None or self._prompt_hash != current_hash:
             logging.info("🧠 Assembling Master System Prompt (Kernel + Profile + MoE)...")
+
+            logic_text = ""
+            profile_text = ""
+
+            if not self.db_path.exists():
+                logic_text = "Demo Operating Logic: Be helpful and precise."
+                profile_text = "Demo Profile: User is Roger, an AI systems developer."
+            else:
+                try:
+                    import sqlite3
+
+                    with sqlite3.connect(self.db_path) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT content FROM user_profile WHERE section = 'system_operating_logic'"
+                        )
+                        row_logic = cursor.fetchone()
+                        logic_text = row_logic[0] if row_logic else ""
+
+                        cursor.execute(
+                            "SELECT content FROM user_profile WHERE section = 'dynamic_profile'"
+                        )
+                        row_profile = cursor.fetchone()
+                        profile_text = row_profile[0] if row_profile else ""
+                except Exception as e:
+                    logging.error(f"Error reading profile from master brain SQLite: {e}")
+
             master_prompt = f"""
 You are VROMLIX PRIME, Polymatic Operating System Orchestrator.
 You operate strictly under the architectural definitions provided below.
 Your cognitive state is externalized in these documents. Do not hallucinate features.
 
 === 1. SYSTEM OPERATING LOGIC (KERNEL) ===
-{self._read_file_cached(self.logic_file)}
+{logic_text}
 
 === 2. DYNAMIC PROFILE (THE SOUL) ===
-{self._read_file_cached(self.profile_file)}
+{profile_text}
 
 === ORCHESTRATOR DIRECTIVES ===
 1. Analyze the user's input and the recent conversation history.
@@ -179,6 +229,12 @@ class SessionTracker:
 
     def __init__(self):
         import importlib
+        import sys
+
+        # Append path to 04_scripts/web relative to prime/memory.py location
+        web_path = str(Path(__file__).parents[2] / "web")
+        if web_path not in sys.path:
+            sys.path.append(web_path)
 
         try:
             chat_mod = importlib.import_module("chat_session_manager")

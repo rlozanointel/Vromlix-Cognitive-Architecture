@@ -31,7 +31,9 @@ class DeepMemoryRetriever:
         self.db_path = str(vromlix.paths.databases / "vromlix_memory.sqlite")
         embed_config = vromlix.get_secret("EMBEDDINGS")
         self.embedding_model = (
-            embed_config["model_id"] if embed_config else "gemini-embedding-2-preview"
+            embed_config.get("model_id") or embed_config.get("primary")
+            if embed_config
+            else "gemini-embedding-2-preview"
         )
 
     def retrieve_context(self, query: str, top_k: int = 5) -> str:
@@ -151,23 +153,29 @@ class SubconsciousUpdater(threading.Thread):
             res = vromlix.query_universal_llm(system_prompt="", user_prompt=prompt, role="VOLUMEN")
             result = res.text.strip()
             if result != "NONE" and "<user_fact" in result:
-                history_path = vromlix.paths.prompts / "sys_roger_historial_biografico.xml"
-                if history_path.exists():
-                    with history_path.open(encoding="utf-8") as f:
-                        content = f.read()
-                    if "</historical_archive>" in content:
-                        new_content = content.replace(
-                            "</historical_archive>",
-                            f"  {result}\n</historical_archive>",
-                        )
-                        tmp_path = history_path.with_suffix(".xml.tmp")
-                        try:
-                            with tmp_path.open("w", encoding="utf-8") as f:
-                                f.write(new_content)
-                            tmp_path.replace(history_path)
-                        except Exception:
-                            if tmp_path.exists():
-                                tmp_path.unlink()
+                db_path = vromlix.paths.databases / "vromlix_master_brain.sqlite"
+                if db_path.exists():
+                    import sqlite3
+
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT content FROM user_profile WHERE section = 'biographical_history'"
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        content = row[0]
+                        if "</historical_archive>" in content:
+                            new_content = content.replace(
+                                "</historical_archive>",
+                                f"  {result}\n</historical_archive>",
+                            )
+                            cursor.execute(
+                                "UPDATE user_profile SET content = ?, updated_at = ? WHERE section = 'biographical_history'",
+                                (new_content, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                            )
+                            conn.commit()
+                    conn.close()
         except Exception as e:
             logging.error(f"SubconsciousUpdater failed: {e}")
 

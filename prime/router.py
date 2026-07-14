@@ -30,7 +30,11 @@ class MoERouter:
         self._backend = backend
         self.model_id = backend.get_model("VOLUMEN")
         embed_cfg = backend.get_secret("EMBEDDINGS")
-        self.embed_model = embed_cfg["model_id"] if embed_cfg else "gemini-embedding-2-preview"
+        self.embed_model = (
+            embed_cfg.get("model_id") or embed_cfg.get("primary")
+            if embed_cfg
+            else "gemini-embedding-2-preview"
+        )
         self.monitor = monitor
         self.router_prompt = router_prompt
         self.cache_db_path = backend.paths.databases / "cache.sqlite"

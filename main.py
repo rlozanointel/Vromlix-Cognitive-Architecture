@@ -98,7 +98,7 @@ class VromlixTerminalUI:
         self.master_prompt = self.loader.build_master_system_prompt()
         self.tracker = SessionTracker()
 
-        moe_content = self.loader._read_file(self.loader.moe_file)
+        moe_content = self.loader.load_moe_routing()
         self.router = MoERouter(
             moe_content,
             self.monitor,
