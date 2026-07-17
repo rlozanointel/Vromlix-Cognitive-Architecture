@@ -410,12 +410,26 @@ class VromlixOrchestrator:
         self.config_path = self._get_config_path()
         self.config = self._load_config()
 
-        keys_list = getattr(self.config, "LISTA_DE_APIS", [])
+        # Load environment variables from .env files
+        self._load_env()
+
+        # Load keys from env (GEMINI_API_KEYS) or fallback to config
+        keys_list = []
+        if "GEMINI_API_KEYS" in os.environ:
+            keys_list = [k.strip() for k in os.environ["GEMINI_API_KEYS"].split(",") if k.strip()]
+        if not keys_list and self.config:
+            keys_list = getattr(self.config, "LISTA_DE_APIS", [])
+
         api_db_path = str(self.paths.databases / "vromlix_api_manager.sqlite")
         self.key_manager = ActiveKeyManager(keys_list, cooldown_seconds=61.0, db_path=api_db_path)
 
         # NUEVO: Rotador SOTA para tus 6 cuentas de Groq
-        groq_keys_list = getattr(self.config, "LISTA_GROQ", [])
+        groq_keys_list = []
+        if "GROQ_API_KEYS" in os.environ:
+            groq_keys_list = [k.strip() for k in os.environ["GROQ_API_KEYS"].split(",") if k.strip()]
+        if not groq_keys_list and self.config:
+            groq_keys_list = getattr(self.config, "LISTA_GROQ", [])
+
         self.groq_key_manager = None
         if groq_keys_list:
             groq_db_path = str(self.paths.databases / "groq_api_manager.sqlite")
@@ -501,6 +515,35 @@ class VromlixOrchestrator:
         paths = Paths(self.base_path)
         paths.sandbox.mkdir(parents=True, exist_ok=True)
         return paths
+
+    def _load_env(self):
+        env_paths = [
+            self.base_path / ".env",
+            self.base_path / ".secrets" / ".env",
+            Path.home() / ".vromlix.env",
+            Path.cwd() / ".env",
+        ]
+        loaded_vars = {}
+        for p in env_paths:
+            if p.exists():
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            if "=" in line:
+                                k, v = line.split("=", 1)
+                                k = k.strip()
+                                v = v.strip()
+                                # Remove quotes
+                                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                                    v = v[1:-1]
+                                os.environ.setdefault(k, v)
+                                loaded_vars[k] = v
+                except Exception as e:
+                    logging.warning(f"Error loading env from {p}: {e}")
+        return loaded_vars
 
     def _get_config_path(self):
         if self.is_colab:
@@ -601,6 +644,14 @@ class VromlixOrchestrator:
                 fresh_key = self.key_manager.get_fresh_key()
                 if fresh_key:
                     return fresh_key
+
+            # Prioritize environment variables loaded from .env
+            if key_name in os.environ:
+                return os.environ[key_name]
+            if key_name == "GITHUB_TOKEN" and "GITHUB_PAT" in os.environ:
+                return os.environ["GITHUB_PAT"]
+            if key_name == "GITHUB_PAT" and "GITHUB_TOKEN" in os.environ:
+                return os.environ["GITHUB_TOKEN"]
 
             registry = getattr(self.config, "MODEL_ROUTING_REGISTRY", {})
             if key_name in registry:
