@@ -426,7 +426,9 @@ class VromlixOrchestrator:
         # NUEVO: Rotador SOTA para tus 6 cuentas de Groq
         groq_keys_list = []
         if "GROQ_API_KEYS" in os.environ:
-            groq_keys_list = [k.strip() for k in os.environ["GROQ_API_KEYS"].split(",") if k.strip()]
+            groq_keys_list = [
+                k.strip() for k in os.environ["GROQ_API_KEYS"].split(",") if k.strip()
+            ]
         if not groq_keys_list and self.config:
             groq_keys_list = getattr(self.config, "LISTA_GROQ", [])
 
@@ -527,7 +529,7 @@ class VromlixOrchestrator:
         for p in env_paths:
             if p.exists():
                 try:
-                    with open(p, "r", encoding="utf-8") as f:
+                    with open(p, encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
                             if not line or line.startswith("#"):
@@ -537,7 +539,9 @@ class VromlixOrchestrator:
                                 k = k.strip()
                                 v = v.strip()
                                 # Remove quotes
-                                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                                if (v.startswith('"') and v.endswith('"')) or (
+                                    v.startswith("'") and v.endswith("'")
+                                ):
                                     v = v[1:-1]
                                 os.environ.setdefault(k, v)
                                 loaded_vars[k] = v
