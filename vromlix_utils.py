@@ -1107,8 +1107,12 @@ vromlix = VromlixOrchestrator()
 class IOManager:
     @staticmethod
     def select_file(provided_path: str | None = None, title: str = "Select a file") -> str | None:
-        if provided_path and Path(provided_path).exists():
-            return provided_path
+        if provided_path:
+            try:
+                if Path(provided_path).exists():
+                    return provided_path
+            except (PermissionError, OSError):
+                return None
         if vromlix.is_colab:
             import importlib
 
